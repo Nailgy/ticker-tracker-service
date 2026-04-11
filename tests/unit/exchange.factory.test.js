@@ -426,8 +426,8 @@ describe('ExchangeFactory', () => {
 
       const normalized = factory.normalizeTicker('BTC/USDT', rawTicker);
 
-      expect(normalized.bid).toBeUndefined();
-      expect(normalized.ask).toBeUndefined();
+      expect(normalized.bid).toBeNull();
+      expect(normalized.ask).toBeNull();
       expect(normalized.last).toBe(68000);
     });
 

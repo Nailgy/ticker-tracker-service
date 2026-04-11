@@ -241,6 +241,11 @@ class ExchangeFactory {
       symbol,
       exchange: this.config.exchange,
       marketType: this.config.marketType,
+      last: null,
+      bid: null,
+      ask: null,
+      baseVolume: null,
+      quoteVolume: null,
     };
 
     // Map fields according to rules

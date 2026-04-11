@@ -154,7 +154,7 @@ class ConnectionManager {
   }
 
   /**
-   * Subscription loop for a single batch (async generator consumer)
+   * Subscription loop for a single batch
    * INTERNAL: Runs in background as a fire-and-forget async task
    * @private
    */
@@ -169,52 +169,50 @@ class ConnectionManager {
       while (this.isRunning) {
         try {
           // Watch tickers for this batch via CCXT Pro
-          const generator = await this.exchange.watchTickers(symbols);
+          // watchTickers() returns ticker updates on each call
+          const tickers = await this.exchange.watchTickers(symbols);
 
-          // Consume updates from generator
-          for await (const ticker of generator) {
-            if (!this.isRunning) {
-              break;
-            }
+          if (!this.isRunning) {
+            break;
+          }
 
-            // Ticker is typically: {symbol: rawTickerData}
-            if (ticker && typeof ticker === 'object') {
-              for (const [symbol, rawTicker] of Object.entries(ticker)) {
-                try {
-                  // Normalize ticker data
-                  const normalized = this.config.exchangeFactory.normalizeTicker(
+          // Ticker data: {symbol: rawTickerData, ...}
+          if (tickers && typeof tickers === 'object') {
+            for (const [symbol, rawTicker] of Object.entries(tickers)) {
+              try {
+                // Normalize ticker data
+                const normalized = this.config.exchangeFactory.normalizeTicker(
+                  symbol,
+                  rawTicker
+                );
+
+                if (normalized) {
+                  // Persist to Redis
+                  const exchangeName = this.config.exchangeFactory.config.exchange;
+                  const marketType = this.config.exchangeFactory.config.marketType;
+
+                  await this.config.redisService.updateTicker(
+                    exchangeName,
+                    marketType,
                     symbol,
-                    rawTicker
+                    normalized
                   );
 
-                  if (normalized) {
-                    // Persist to Redis
-                    const exchangeName = this.config.exchangeFactory.config.exchange;
-                    const marketType = this.config.exchangeFactory.config.marketType;
-
-                    await this.config.redisService.updateTicker(
-                      exchangeName,
-                      marketType,
-                      symbol,
-                      normalized
-                    );
-
-                    this.stats.totalUpdates++;
-                  }
-                } catch (error) {
-                  this.stats.normalizationErrors++;
-                  this.config.logger('error',
-                    `ConnectionManager: Normalization error [${batchId}]`,
-                    { symbol, message: error.message }
-                  );
+                  this.stats.totalUpdates++;
                 }
+              } catch (error) {
+                this.stats.normalizationErrors++;
+                this.config.logger('error',
+                  `ConnectionManager: Normalization error [${batchId}]`,
+                  { symbol, message: error.message }
+                );
               }
             }
           }
         } catch (error) {
           this.stats.failedUpdates++;
           this.config.logger('error',
-            `ConnectionManager: Generator error [${batchId}]`,
+            `ConnectionManager: Subscription error [${batchId}]`,
             { message: error.message }
           );
 
