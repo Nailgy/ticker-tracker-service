@@ -420,6 +420,19 @@ class ConnectionManager {
 
     if (symbol) {
       this.nonRetryableSymbols.add(symbol);
+
+      // ✅ UPDATE MAIN BATCH STATE: Remove from this.batches so tests/externals see the change
+      const batchIndex = parseInt(batchId.split('-')[1], 10);
+      if (!isNaN(batchIndex) && this.batches[batchIndex]) {
+        if (Array.isArray(this.batches[batchIndex])) {
+          // batches is array of arrays
+          this.batches[batchIndex] = this.batches[batchIndex].filter(s => s !== symbol);
+        } else if (this.batches[batchIndex] && Array.isArray(this.batches[batchIndex].symbols)) {
+          // batches is array of objects with .symbols property
+          this.batches[batchIndex].symbols = this.batches[batchIndex].symbols.filter(s => s !== symbol);
+        }
+      }
+
       this.config.logger('warn',
         `ConnectionManager: Symbol marked non-retryable [${batchId}]`,
         { symbol, message: error.message }
