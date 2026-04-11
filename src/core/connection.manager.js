@@ -223,8 +223,10 @@ class ConnectionManager {
       this._startHealthCheck(batchId);
 
       // Initialize batch state for health checks
+      // Use a future timestamp to give watchTickers time to establish connection
+      // (can take 60+ seconds for 100+ symbols to connect and receive first data)
       this.batchState.set(batchId, {
-        lastMessageAt: Date.now(),
+        lastMessageAt: Date.now() + (this.config.healthCheckTimeoutMs || 60000) + 30000, // +30s grace
         stale: false,
       });
 
@@ -251,6 +253,7 @@ class ConnectionManager {
           this.retryAttempts.set(batchId, 0);
 
           // ✅ Phase 5: Update batch state - CRITICAL for health checks
+          // Updates timestamp when data ACTUALLY arrives (not on initialization)
           const batchState = this.batchState.get(batchId);
           if (batchState) {
             batchState.lastMessageAt = Date.now();

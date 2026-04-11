@@ -13,6 +13,7 @@
 
 const { Command } = require('commander');
 const { buildConfig, getConfigSummary } = require('./config');
+const TickerWatcher = require('./core/ticker.watcher');
 
 const program = new Command();
 
@@ -54,16 +55,21 @@ program
       console.log(JSON.stringify(getConfigSummary(config), null, 2));
       console.log('');
 
-      // Phase 2: Instantiate and start TickerWatcher
-      console.log('⏳ Phase 2 implementation pending: TickerWatcher initialization');
-      console.log('   - ConnectionManager setup');
-      console.log('   - RedisService connection');
-      console.log('   - ExchangeFactory market loading');
-      console.log('   - Ticker subscription launch');
+      // Phase 4: Instantiate and start TickerWatcher orchestrator
+      console.log('⏳ Initializing service...');
+      const watcher = new TickerWatcher(config);
+      await watcher.start();
 
-      process.exit(0);
+      console.log('✅ Service started successfully');
+      console.log('   Press Ctrl+C to stop\n');
+
+      // Block indefinitely (watcher manages timers and signals)
+      // Process won't exit unless SIGINT/SIGTERM received or error occurs
     } catch (error) {
       console.error('❌ Error:', error.message);
+      if (process.env.DEBUG || options.debug) {
+        console.error(error.stack);
+      }
       process.exit(1);
     }
   });
