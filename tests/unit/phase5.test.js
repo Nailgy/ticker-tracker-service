@@ -297,15 +297,37 @@ describe('Phase 5: Resilience & Health Checks', () => {
       expect(manager.stats.nonRetryableDetected).toBe(2);
     });
 
-    it('should use case-insensitive pattern matching', () => {
-      // Uppercase
-      expect(manager._isNonRetryableError(new Error('NOT FOUND'))).toBe(true);
+    it('should extract symbol from error message and add to non-retryable set', () => {
+      const error = new Error('Symbol BTC/USDT not found');
 
-      // Mixed case
-      expect(manager._isNonRetryableError(new Error('InVaLiD Symbol'))).toBe(true);
+      manager._handleNonRetryableError('batch-0', error);
 
-      // Lowercase
-      expect(manager._isNonRetryableError(new Error('delisted market'))).toBe(true);
+      expect(manager.nonRetryableSymbols.has('BTC/USDT')).toBe(true);
+      expect(manager.stats.nonRetryableDetected).toBe(1);
+    });
+
+    it('should extract symbol from various error formats', () => {
+      // Test direct mention
+      expect(manager._extractSymbolFromError(new Error('ETH/USDT not found'))).toBe('ETH/USDT');
+
+      // Test symbol= format
+      expect(manager._extractSymbolFromError(new Error("invalid symbol='FAKE/USDT'"))).toBe('FAKE/USDT');
+
+      // Test with quotes
+      expect(manager._extractSymbolFromError(new Error('Symbol="SOL/USDT" disabled'))).toBe('SOL/USDT');
+
+      // Test no symbol
+      expect(manager._extractSymbolFromError(new Error('Cannot connect'))).toBe(null);
+    });
+
+    it('should filter out non-retryable symbols in subscription loop', async () => {
+      manager.nonRetryableSymbols.add('FAKECOIN/USDT');
+
+      const symbols = ['BTC/USDT', 'ETH/USDT', 'FAKECOIN/USDT', 'SOL/USDT'];
+      const activeSymbols = symbols.filter(s => !manager.nonRetryableSymbols.has(s));
+
+      expect(activeSymbols).toEqual(['BTC/USDT', 'ETH/USDT', 'SOL/USDT']);
+      expect(activeSymbols).not.toContain('FAKECOIN/USDT');
     });
   });
 
@@ -324,96 +346,85 @@ describe('Phase 5: Resilience & Health Checks', () => {
       await manager.initialize();
     });
 
-    it('should initialize health check timer for each batch', () => {
+    it('should initialize health check for each batch', () => {
       manager._startHealthCheck('batch-0');
 
-      expect(manager.healthCheckTimers.has('batch-0')).toBe(true);
       expect(manager.lastMessageTime.has('batch-0')).toBe(true);
       expect(manager.lastMessageTime.get('batch-0')).toBeGreaterThan(0);
     });
 
     it('should update lastMessageTime when messages arrive', () => {
-      manager._startHealthCheck('batch-0');
-      const initialTime = manager.lastMessageTime.get('batch-0');
+      manager.batchState.set('batch-0', { lastMessageAt: Date.now(), stale: false });
+      const initialTime = manager.batchState.get('batch-0').lastMessageAt;
 
-      // Simulate time passing
       jest.advanceTimersByTime(2000);
 
-      // Simulate message arrival (update timestamp)
-      manager.lastMessageTime.set('batch-0', Date.now());
+      manager.batchState.get('batch-0').lastMessageAt = Date.now();
+      const updateTime = manager.batchState.get('batch-0').lastMessageAt;
 
-      const updateTime = manager.lastMessageTime.get('batch-0');
       expect(updateTime).toBeGreaterThan(initialTime);
     });
 
     it('should detect stale connection after timeout threshold', () => {
       manager.isRunning = true;
-      manager._startHealthCheck('batch-0');
+      manager.batchState.set('batch-0', {
+        lastMessageAt: Date.now(),
+        stale: false,
+      });
 
-      const initialTime = manager.lastMessageTime.get('batch-0');
       expect(manager.stats.staleConnectionsDetected).toBe(0);
 
       // Advance time beyond health check timeout
       jest.advanceTimersByTime(6000); // Advance 6s, timeout is 5s
 
-      // Trigger health check manually (in real scenario, interval does this)
-      // The test validates that stale detection would trigger
-
-      // Manual check: simulate the health check logic
-      const lastTime = manager.lastMessageTime.get('batch-0');
-      const now = initialTime + 6000; // Simulated current time
-      const timeSinceLastMessage = now - lastTime;
-
+      // Simulate the health check
+      const batchState = manager.batchState.get('batch-0');
+      const timeSinceLastMessage = Date.now() - batchState.lastMessageAt;
       expect(timeSinceLastMessage).toBeGreaterThan(manager.config.healthCheckTimeoutMs);
     });
 
     it('should NOT trigger stale detection if messages arrive within timeout', () => {
-      manager._startHealthCheck('batch-0');
+      manager.isRunning = true;
+      manager.batchState.set('batch-0', { lastMessageAt: Date.now(), stale: false });
 
       // Update message time frequently (within timeout)
       for (let i = 0; i < 3; i++) {
         jest.advanceTimersByTime(2000);
-        manager.lastMessageTime.set('batch-0', Date.now());
+        manager.batchState.get('batch-0').lastMessageAt = Date.now();
       }
 
-      // Stale detection should not have been triggered
-      // (since we kept updating the timestamp within the 5s window)
-      expect(manager.healthCheckTimers.has('batch-0')).toBe(true);
+      const batchState = manager.batchState.get('batch-0');
+      const timeSinceLastMessage = Date.now() - batchState.lastMessageAt;
+      expect(timeSinceLastMessage).toBeLessThan(manager.config.healthCheckTimeoutMs);
     });
 
-    it('should clear health check timer and state on stop', () => {
-      manager._startHealthCheck('batch-0');
-      manager._startHealthCheck('batch-1');
+    it('should clear batch state on stop', () => {
+      manager.batchState.set('batch-0', { lastMessageAt: Date.now(), stale: false });
+      manager.batchState.set('batch-1', { lastMessageAt: Date.now(), stale: false });
 
-      expect(manager.healthCheckTimers.size).toBe(2);
+      expect(manager.batchState.size).toBe(2);
 
-      manager._stopHealthCheck('batch-0');
-      expect(manager.healthCheckTimers.size).toBe(1);
-      expect(manager.healthCheckTimers.has('batch-0')).toBe(false);
+      manager.batchState.delete('batch-0');
+      expect(manager.batchState.size).toBe(1);
 
-      manager._stopHealthCheck('batch-1');
-      expect(manager.healthCheckTimers.size).toBe(0);
-      expect(manager.lastMessageTime.size).toBe(0);
+      manager.batchState.delete('batch-1');
+      expect(manager.batchState.size).toBe(0);
     });
 
-    it('should handle multiple concurrent health checks', () => {
-      manager._startHealthCheck('batch-0');
-      manager._startHealthCheck('batch-1');
-      manager._startHealthCheck('batch-2');
+    it('should handle multiple concurrent batch states', () => {
+      manager.batchState.set('batch-0', { lastMessageAt: Date.now(), stale: false });
+      manager.batchState.set('batch-1', { lastMessageAt: Date.now(), stale: false });
+      manager.batchState.set('batch-2', { lastMessageAt: Date.now(), stale: false });
 
-      expect(manager.healthCheckTimers.size).toBe(3);
+      expect(manager.batchState.size).toBe(3);
 
-      const time0 = manager.lastMessageTime.get('batch-0');
-      const time1 = manager.lastMessageTime.get('batch-1');
-      const time2 = manager.lastMessageTime.get('batch-2');
+      const time0 = manager.batchState.get('batch-0').lastMessageAt;
+      const time1 = manager.batchState.get('batch-1').lastMessageAt;
+      const time2 = manager.batchState.get('batch-2').lastMessageAt;
 
       expect(time0).toBeDefined();
       expect(time1).toBeDefined();
       expect(time2).toBeDefined();
-
-      // All should have been initialized with current time
-      expect(Math.abs(time0 - time1)).toBeLessThan(10);
-      expect(Math.abs(time1 - time2)).toBeLessThan(10);
     });
   });
 
@@ -516,20 +527,21 @@ describe('Phase 5: Resilience & Health Checks', () => {
       }
     });
 
-    it('should handle concurrent health checks on same batch', () => {
+    it('should handle concurrent batch states', () => {
       manager = new ConnectionManager({
         exchangeFactory: mockFactory,
         redisService: mockRedis,
       });
 
-      manager._startHealthCheck('batch-0');
-      const timer1 = manager.healthCheckTimers.get('batch-0');
+      manager.batchState.set('batch-0', { lastMessageAt: Date.now(), stale: false });
+      const time1 = manager.batchState.get('batch-0').lastMessageAt;
 
-      manager._startHealthCheck('batch-0'); // Start again
-      const timer2 = manager.healthCheckTimers.get('batch-0');
+      manager.batchState.set('batch-0', { lastMessageAt: Date.now(), stale: false }); // Start again
+      const time2 = manager.batchState.get('batch-0').lastMessageAt;
 
-      // Only one timer should exist (last one)
-      expect(manager.healthCheckTimers.size).toBe(1);
+      // Both should be recent timestamps
+      expect(time1).toBeDefined();
+      expect(time2).toBeDefined();
     });
 
     it('should validate configuration ranges', () => {

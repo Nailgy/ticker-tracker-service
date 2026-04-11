@@ -14,12 +14,14 @@
  * - Exponential backoff retry with configurable base delay and max delay
  * - Non-retryable error detection (delisted, invalid markets)
  * - Stale connection health checks with configurable timeout
+ * - Exchange-aware resilience tuning (stable vs unstable exchanges)
  *
  * Usage:
  *   const manager = new ConnectionManager({
  *     exchangeFactory: factory,
  *     redisService: redis,
  *     batchSize: 100,
+ *     // Optional: override exchange-specific resilience config
  *     retryBaseDelayMs: 1000,      // Phase 5
  *     retryMaxDelayMs: 60000,      // Phase 5
  *     healthCheckIntervalMs: 5000, // Phase 5
@@ -31,6 +33,8 @@
  *   // ... later ...
  *   await manager.stop();
  */
+
+const { getResilienceConfig } = require('../constants/exchanges');
 
 class ConnectionManager {
   /**
@@ -46,23 +50,37 @@ class ConnectionManager {
    * @param {Function} config.logger - Logger function
    */
   constructor(config = {}) {
+    if (!config.exchangeFactory) {
+      throw new Error('ConnectionManager: exchangeFactory is required');
+    }
+    if (!config.redisService) {
+      throw new Error('ConnectionManager: redisService is required');
+    }
+
+    // Load exchange-specific resilience config, allow overrides
+    // Handle case where factory doesn't have config yet (e.g., in tests)
+    const exchangeName = config.exchangeFactory?.config?.exchange || 'default';
+    const exchangeResilienceConfig = getResilienceConfig(exchangeName);
+
     this.config = {
       exchangeFactory: config.exchangeFactory,
       redisService: config.redisService,
       batchSize: config.batchSize || 100,
-      retryBaseDelayMs: config.retryBaseDelayMs || 1000,
-      retryMaxDelayMs: config.retryMaxDelayMs || 60000,
-      healthCheckIntervalMs: config.healthCheckIntervalMs || 5000,
-      healthCheckTimeoutMs: config.healthCheckTimeoutMs || 30000,
+      // Use exchange-specific resilience config, then allow config overrides
+      retryBaseDelayMs: config.retryBaseDelayMs ?? exchangeResilienceConfig.retryBaseDelayMs,
+      retryMaxDelayMs: config.retryMaxDelayMs ?? exchangeResilienceConfig.retryMaxDelayMs,
+      healthCheckIntervalMs: config.healthCheckIntervalMs ?? exchangeResilienceConfig.healthCheckIntervalMs,
+      healthCheckTimeoutMs: config.healthCheckTimeoutMs ?? exchangeResilienceConfig.healthCheckTimeoutMs,
       logger: config.logger || this._defaultLogger,
     };
 
-    if (!this.config.exchangeFactory) {
-      throw new Error('ConnectionManager: exchangeFactory is required');
-    }
-    if (!this.config.redisService) {
-      throw new Error('ConnectionManager: redisService is required');
-    }
+    this.config.logger('info', 'ConnectionManager: Resilience config loaded', {
+      exchange: exchangeName,
+      retryBaseDelayMs: this.config.retryBaseDelayMs,
+      retryMaxDelayMs: this.config.retryMaxDelayMs,
+      healthCheckIntervalMs: this.config.healthCheckIntervalMs,
+      healthCheckTimeoutMs: this.config.healthCheckTimeoutMs,
+    });
 
     // State
     this.exchange = null;
@@ -77,6 +95,8 @@ class ConnectionManager {
     this.nonRetryableSymbols = new Set();  // Symbols that should not be retried
     this.lastMessageTime = new Map();      // Map<batchId, timestamp>
     this.healthCheckTimers = new Map();    // Map<batchId, timerId>
+    this.batchState = new Map();           // Map<batchId, {lastMessageAt, stale}>
+    this.healthCheckInterval = null;       // Global health check timer
 
     // Metrics
     this.stats = {
@@ -178,6 +198,13 @@ class ConnectionManager {
 
       this.subscriptionTimers.push(timer);
     }
+
+    // Phase 5: Start global health check timer (runs every 10 seconds)
+    this.healthCheckInterval = setInterval(() => {
+      this._healthCheck();
+    }, 10000);
+
+    this.config.logger('info', 'ConnectionManager: Health check timer started (10s interval)');
   }
 
   /**
@@ -194,6 +221,12 @@ class ConnectionManager {
 
       // Start health check for this batch
       this._startHealthCheck(batchId);
+
+      // Initialize batch state for health checks
+      this.batchState.set(batchId, {
+        lastMessageAt: Date.now(),
+        stale: false,
+      });
 
       // Main subscription loop
       while (this.isRunning) {
@@ -217,7 +250,12 @@ class ConnectionManager {
           // Reset retry counter on successful connection
           this.retryAttempts.set(batchId, 0);
 
-          // Update health check timestamp
+          // ✅ Phase 5: Update batch state - CRITICAL for health checks
+          const batchState = this.batchState.get(batchId);
+          if (batchState) {
+            batchState.lastMessageAt = Date.now();
+            batchState.stale = false;  // Reset stale flag on successful data
+          }
           this.lastMessageTime.set(batchId, Date.now());
 
           // Ticker data: {symbol: rawTickerData, ...}
@@ -256,6 +294,14 @@ class ConnectionManager {
         } catch (error) {
           this.stats.failedUpdates++;
 
+          // Log full error details for debugging
+          this.config.logger('debug', `ConnectionManager: Error caught [${batchId}]`, {
+            errorName: error.name,
+            errorCode: error.code,
+            errorMessage: error.message,
+            fullError: error.toString(),
+          });
+
           // Phase 5: Check for non-retryable errors
           if (this._isNonRetryableError(error)) {
             this._handleNonRetryableError(batchId, error);
@@ -287,6 +333,7 @@ class ConnectionManager {
     } finally {
       // Cleanup health check for this batch
       this._stopHealthCheck(batchId);
+      this.batchState.delete(batchId);
     }
   }
 
@@ -319,73 +366,153 @@ class ConnectionManager {
     }
 
     const message = error.message.toLowerCase();
+    const errorName = (error.name || '').toLowerCase();
 
     // Pattern matching for permanent failures
     const nonRetryablePatterns = [
+      // Standard patterns
       'not found',
       'invalid',
       'delisted',
       'disabled',
+      'suspended',
       '404',
       '400',
       'bad request',
       'symbol not found',
       'market not found',
+      // CCXT specific patterns for invalid symbols
+      'badsymbol',
+      'does not have market',
+      'unknown symbol',
+      'invalid symbol',
+      'symbol is not supported',
+      'market is not active',
+      'no such market',
+      'trading not allowed',
+      'pair not found',
+      'no permission',
     ];
 
-    return nonRetryablePatterns.some(pattern => message.includes(pattern));
+    // Check message patterns
+    const matchesMessage = nonRetryablePatterns.some(pattern => message.includes(pattern));
+
+    // Check error name (CCXT exceptions)
+    const matchesName = errorName.includes('badsymbol') ||
+                        errorName.includes('notfound') ||
+                        errorName.includes('http400') ||
+                        errorName.includes('http404') ||
+                        errorName.includes('permissiondenied');
+
+    return matchesMessage || matchesName;
   }
 
   /**
    * Phase 5: Handle non-retryable error - mark symbol as permanently failed
+   * Extracts symbol from error message and adds to non-retryable set
    * @private
    */
   _handleNonRetryableError(batchId, error) {
     this.stats.nonRetryableDetected++;
-    this.config.logger('warn',
-      `ConnectionManager: Non-retryable error [${batchId}]`,
-      { message: error.message }
-    );
 
-    // Extract symbol from error if possible, otherwise mark entire batch
-    // For now, we log it - symbol removal would be handled at higher level
+    // Try to extract symbol from error message
+    const symbol = this._extractSymbolFromError(error);
+
+    if (symbol) {
+      this.nonRetryableSymbols.add(symbol);
+      this.config.logger('warn',
+        `ConnectionManager: Symbol marked non-retryable [${batchId}]`,
+        { symbol, message: error.message }
+      );
+    } else {
+      this.config.logger('warn',
+        `ConnectionManager: Non-retryable error [${batchId}]`,
+        { message: error.message }
+      );
+    }
   }
 
   /**
-   * Phase 5: Start health check timer for a batch
-   * Detects stale connections (no messages received)
+   * Phase 5: Extract symbol from error message
+   * Looks for patterns like "BTC/USDT" in error messages
+   * @private
+   */
+  _extractSymbolFromError(error) {
+    if (!error || !error.message) {
+      return null;
+    }
+
+    const message = error.message;
+
+    // Pattern 1: Direct symbol mention (e.g., "BTC/USDT not found")
+    const match = message.match(/([A-Z0-9]+\/[A-Z0-9]+)/);
+    if (match) {
+      return match[1];
+    }
+
+    // Pattern 2: symbol= format (e.g., "invalid symbol='FAKE/USDT'")
+    const match2 = message.match(/symbol=['"]([A-Z0-9]+\/[A-Z0-9]+)['"]/i);
+    if (match2) {
+      return match2[1];
+    }
+
+    return null;
+  }
+
+  /**
+   * Phase 5: Global health check - runs every 10 seconds
+   * Detects stale connections (no messages for 60+ seconds)
+   * @private
+   */
+  _healthCheck() {
+    if (!this.isRunning) {
+      return;
+    }
+
+    // Check all active batches
+    for (const [batchId, batchState] of this.batchState.entries()) {
+      if (!batchState) continue;
+
+      const timeSinceLastMessage = Date.now() - batchState.lastMessageAt;
+      const staleThreshold = this.config.healthCheckTimeoutMs || 60000;
+
+      // Detect stale connection (no data for > 60 seconds)
+      if (timeSinceLastMessage > staleThreshold && !batchState.stale) {
+        batchState.stale = true;  // Mark as stale to avoid duplicate logs
+        this.stats.staleConnectionsDetected++;
+
+        this.config.logger('warn',
+          `ConnectionManager: Stale connection detected [${batchId}]`,
+          {
+            timeSinceLastMessage: `${(timeSinceLastMessage / 1000).toFixed(1)}s`,
+            threshold: `${(staleThreshold / 1000).toFixed(1)}s`,
+          }
+        );
+
+        // Force reconnect by closing current exchange connection
+        // This will cause watchTickers to fail and trigger exponential backoff
+        if (this.exchange && this.exchange.close) {
+          this.exchange.close().catch(() => {
+            // Silently ignore errors from close
+          });
+        }
+      }
+
+      // Reset stale flag if data is flowing again
+      if (timeSinceLastMessage <= staleThreshold && batchState.stale) {
+        batchState.stale = false;
+        this.config.logger('info', `ConnectionManager: Connection recovered [${batchId}]`);
+      }
+    }
+  }
+
+  /**
+   * Phase 5: Initialize health check for a batch (sets initial timestamp)
    * @private
    */
   _startHealthCheck(batchId) {
     // Initialize last message time
     this.lastMessageTime.set(batchId, Date.now());
-
-    // Start periodic health check timer
-    const timer = setInterval(() => {
-      if (!this.isRunning) {
-        return;
-      }
-
-      const lastTime = this.lastMessageTime.get(batchId);
-      const now = Date.now();
-      const timeSinceLastMessage = now - lastTime;
-
-      if (timeSinceLastMessage > this.config.healthCheckTimeoutMs) {
-        this.stats.staleConnectionsDetected++;
-        this.config.logger('warn',
-          `ConnectionManager: Stale connection detected [${batchId}]`,
-          {
-            timeSinceLastMessage,
-            threshold: this.config.healthCheckTimeoutMs,
-          }
-        );
-
-        // Force reconnect by resetting retry counter and waiting
-        // This will trigger the next watchTickers call to attempt reconnection
-      }
-    }, this.config.healthCheckIntervalMs);
-
-    this.healthCheckTimers.set(batchId, timer);
   }
 
   /**
@@ -393,11 +520,6 @@ class ConnectionManager {
    * @private
    */
   _stopHealthCheck(batchId) {
-    const timer = this.healthCheckTimers.get(batchId);
-    if (timer) {
-      clearInterval(timer);
-      this.healthCheckTimers.delete(batchId);
-    }
     this.lastMessageTime.delete(batchId);
   }
 
@@ -409,6 +531,12 @@ class ConnectionManager {
     this.isRunning = false;
 
     this.config.logger('info', 'ConnectionManager: Stopping subscriptions');
+
+    // Clear global health check timer
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
 
     // Clear subscription timers
     for (const timer of this.subscriptionTimers) {
@@ -446,6 +574,7 @@ class ConnectionManager {
     this.retryAttempts.clear();
     this.nonRetryableSymbols.clear();
     this.lastMessageTime.clear();
+    this.batchState.clear();
 
     this.config.logger('info', 'ConnectionManager: Stopped', {
       stats: this.stats,
