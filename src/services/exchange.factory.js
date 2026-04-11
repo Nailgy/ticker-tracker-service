@@ -279,7 +279,12 @@ class ExchangeFactory {
     }
 
     try {
-      const allMarkets = await this.exchangeInstance.loadMarkets();
+      const marketData = await this.exchangeInstance.loadMarkets();
+
+      // CCXT returns an object keyed by symbol, convert to array
+      const allMarkets = Array.isArray(marketData)
+        ? marketData
+        : Object.values(marketData);
 
       // Filter by market type
       const filtered = allMarkets.filter(market => {

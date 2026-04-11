@@ -23,39 +23,39 @@ jest.mock('ccxt', () => ({
     binance: jest.fn().mockImplementation(() => ({
       id: 'binance',
       name: 'Binance',
-      loadMarkets: jest.fn().mockResolvedValue([
-        {
+      loadMarkets: jest.fn().mockResolvedValue({
+        'BTC/USDT': {
           id: 'btc/usdt',
           symbol: 'BTC/USDT',
           active: true,
           spot: true,
           swap: false,
         },
-        {
+        'ETH/USDT': {
           id: 'eth/usdt',
           symbol: 'ETH/USDT',
           active: true,
           spot: true,
           swap: false,
         },
-        {
+        'BNB/USDT': {
           id: 'bnb/usdt',
           symbol: 'BNB/USDT',
           active: false,
           spot: true,
           swap: false,
         },
-      ]),
+      }),
     })),
     bybit: jest.fn().mockImplementation(() => ({
       id: 'bybit',
       name: 'Bybit',
-      loadMarkets: jest.fn().mockResolvedValue([]),
+      loadMarkets: jest.fn().mockResolvedValue({}),
     })),
     kraken: jest.fn().mockImplementation(() => ({
       id: 'kraken',
       name: 'Kraken',
-      loadMarkets: jest.fn().mockResolvedValue([]),
+      loadMarkets: jest.fn().mockResolvedValue({}),
     })),
   },
 }));
