@@ -1,623 +1,466 @@
 /**
- * ConnectionManager - WebSocket Subscription Coordination with Resilience
+ * ConnectionManager - Pure Coordinator for Subscription Components
  *
- * Manages active WebSocket subscriptions to exchange ticker streams.
+ * REFACTORED: DOES NOT manage subscription loops directly.
+ * Coordinates and delegates to specialized components:
+ * - ExchangeAdapter for CCXT behavior
+ * - SubscriptionEngine for loop coordination
+ * - MarketRegistry for symbol state
+ * - RedisWriter for data persistence
  *
- * Responsibilities:
- * - Initialize and load available markets from exchange
- * - Batch symbols for efficient subscription management
- * - Maintain subscription loops for continuous ticker updates
- * - Normalize incoming tickers and persist to Redis
- * - Handle connection lifecycle (start, stop, cleanup)
+ * This is the ONLY place where these components talk to each other.
+ * NO private method calls. All behavior is delegated.
  *
- * Phase 5: Resilience Mechanisms:
- * - Exponential backoff retry with configurable base delay and max delay
- * - Non-retryable error detection (delisted, invalid markets)
- * - Stale connection health checks with configurable timeout
- * - Exchange-aware resilience tuning (stable vs unstable exchanges)
+ * STRICT ENCAPSULATION: All mutable state is #private.
+ * Access only through public methods (immutable copies).
  *
  * Usage:
- *   const manager = new ConnectionManager({
- *     exchangeFactory: factory,
- *     redisService: redis,
- *     batchSize: 100,
- *     // Optional: override exchange-specific resilience config
- *     retryBaseDelayMs: 1000,      // Phase 5
- *     retryMaxDelayMs: 60000,      // Phase 5
- *     healthCheckIntervalMs: 5000, // Phase 5
- *     healthCheckTimeoutMs: 30000, // Phase 5
- *     logger: logger
- *   });
+ *   const manager = new ConnectionManager(config);
  *   await manager.initialize();
  *   await manager.startSubscriptions();
- *   // ... later ...
+ *   const status = manager.getStatus();
  *   await manager.stop();
  */
 
+const ExchangeAdapter = require('../adapters/ccxt.adapter');
+const SubscriptionEngine = require('./subscription.engine');
+const MarketRegistry = require('./market.registry');
+const RedisWriter = require('../services/redis.writer');
+const { NoProxyProvider, LocalIPProvider } = require('../services/proxy.provider');
 const { getResilienceConfig } = require('../constants/exchanges');
 
+/**
+ * Default adapter factory (creates CCXTAdapter instances)
+ */
+function defaultAdapterFactory(config) {
+  return new ExchangeAdapter(config);
+}
+
+/**
+ * Default proxy provider factory (creates NoProxyProvider)
+ */
+function defaultProxyProviderFactory(config) {
+  if (config.noProxy) {
+    return new NoProxyProvider();
+  }
+  if (Array.isArray(config.localIps) && config.localIps.length > 0) {
+    return new LocalIPProvider(config.localIps, { logger: config.logger });
+  }
+  return new NoProxyProvider();
+}
+
 class ConnectionManager {
-  /**
-   * Initialize ConnectionManager
-   * @param {Object} config - Configuration object
-   * @param {ExchangeFactory} config.exchangeFactory - Exchange factory instance
-   * @param {RedisService} config.redisService - Redis service instance
-   * @param {number} config.batchSize - Number of symbols per batch (default 100)
-   * @param {number} config.retryBaseDelayMs - Base exponential backoff delay in ms (default 1000)
-   * @param {number} config.retryMaxDelayMs - Max exponential backoff delay in ms (default 60000)
-   * @param {number} config.healthCheckIntervalMs - Health check interval in ms (default 5000)
-   * @param {number} config.healthCheckTimeoutMs - Stale connection timeout in ms (default 30000)
-   * @param {Function} config.logger - Logger function
-   */
+  // Private fields - strict encapsulation
+  #adapter = null;
+  #subscriptionEngine = null;
+  #marketRegistry = null;
+  #redisWriter = null;
+  #batches = [];
+
   constructor(config = {}) {
-    if (!config.exchangeFactory) {
-      throw new Error('ConnectionManager: exchangeFactory is required');
-    }
-    if (!config.redisService) {
-      throw new Error('ConnectionManager: redisService is required');
-    }
-
-    // Load exchange-specific resilience config, allow overrides
-    // Handle case where factory doesn't have config yet (e.g., in tests)
-    const exchangeName = config.exchangeFactory?.config?.exchange || 'default';
-    const exchangeResilienceConfig = getResilienceConfig(exchangeName);
-
     this.config = {
-      exchangeFactory: config.exchangeFactory,
-      redisService: config.redisService,
+      exchange: config.exchange || 'binance', // Default for tests
+      marketType: config.marketType || 'spot',
       batchSize: config.batchSize || 100,
-      // Use exchange-specific resilience config, then allow config overrides
-      retryBaseDelayMs: config.retryBaseDelayMs ?? exchangeResilienceConfig.retryBaseDelayMs,
-      retryMaxDelayMs: config.retryMaxDelayMs ?? exchangeResilienceConfig.retryMaxDelayMs,
-      healthCheckIntervalMs: config.healthCheckIntervalMs ?? exchangeResilienceConfig.healthCheckIntervalMs,
-      healthCheckTimeoutMs: config.healthCheckTimeoutMs ?? exchangeResilienceConfig.healthCheckTimeoutMs,
+      subscriptionDelay: config.subscriptionDelay || 100,
       logger: config.logger || this._defaultLogger,
+      redisBatching: config.redisBatching,
+      redisFlushMs: config.redisFlushMs,
+      redisMaxBatch: config.redisMaxBatch,
+      redisOnlyOnChange: config.redisOnlyOnChange,
+      redisMinIntervalMs: config.redisMinIntervalMs,
+
+      // Resilience config (can be overridden)
+      retryBaseDelayMs: config.retryBaseDelayMs,
+      retryMaxDelayMs: config.retryMaxDelayMs,
+      healthCheckIntervalMs: config.healthCheckIntervalMs,
+      healthCheckTimeoutMs: config.healthCheckTimeoutMs,
+
+      // Redis
+      redisService: config.redisService,
+
+      // Factories for dependency injection
+      adapterFactory: config.adapterFactory || defaultAdapterFactory,
+      proxyProviderFactory: config.proxyProviderFactory || defaultProxyProviderFactory,
+      localIps: config.localIps || [],
+      noProxy: config.noProxy || false,
     };
 
-    this.config.logger('info', 'ConnectionManager: Resilience config loaded', {
-      exchange: exchangeName,
-      retryBaseDelayMs: this.config.retryBaseDelayMs,
-      retryMaxDelayMs: this.config.retryMaxDelayMs,
-      healthCheckIntervalMs: this.config.healthCheckIntervalMs,
-      healthCheckTimeoutMs: this.config.healthCheckTimeoutMs,
-    });
+    // Inject exchange-specific resilience config (safely handle undefined)
+    if (this.config.exchange) {
+      const resilience = getResilienceConfig(this.config.exchange);
+      this.config.retryBaseDelayMs = this.config.retryBaseDelayMs ?? resilience.retryBaseDelayMs;
+      this.config.retryMaxDelayMs = this.config.retryMaxDelayMs ?? resilience.retryMaxDelayMs;
+      this.config.healthCheckIntervalMs = this.config.healthCheckIntervalMs ?? resilience.healthCheckIntervalMs;
+      this.config.healthCheckTimeoutMs = this.config.healthCheckTimeoutMs ?? resilience.healthCheckTimeoutMs;
+    }
 
-    // State
-    this.exchange = null;
-    this.symbols = [];
-    this.batches = [];
+    // Public state flags
+    this.isInitialized = false;
     this.isRunning = false;
-    this.subscriptionTasks = [];
-    this.subscriptionTimers = [];
-
-    // Phase 5: Resilience State
-    this.retryAttempts = new Map();        // Map<batchId, attemptCount>
-    this.nonRetryableSymbols = new Set();  // Symbols that should not be retried
-    this.lastMessageTime = new Map();      // Map<batchId, timestamp>
-    this.healthCheckTimers = new Map();    // Map<batchId, timerId>
-    this.batchState = new Map();           // Map<batchId, {lastMessageAt, stale}>
-    this.healthCheckInterval = null;       // Global health check timer
-
-    // Metrics
-    this.stats = {
-      totalUpdates: 0,
-      failedUpdates: 0,
-      normalizationErrors: 0,
-      batchesStarted: 0,
-      retries: 0,                          // Phase 5
-      exponentialBackoffs: 0,              // Phase 5
-      nonRetryableDetected: 0,             // Phase 5
-      staleConnectionsDetected: 0,         // Phase 5
-    };
   }
 
   /**
-   * Default logger (no-op)
-   * @private
+   * Default logger
    */
   _defaultLogger(level, message, data) {
     if (level === 'debug') return;
-    const prefix = `[ConnectionManager:${level.toUpperCase()}]`;
-    console.log(prefix, message, data ? JSON.stringify(data, null, 2) : '');
+    console.log(`[ConnectionManager:${level.toUpperCase()}] ${message}`, data || '');
   }
 
   /**
-   * Initialize: Load markets and create batches
-   * @returns {Promise<void>}
+   * Initialize - create all components and load markets
    */
   async initialize() {
     try {
-      // Create exchange instance
-      this.exchange = this.config.exchangeFactory.createExchange();
-
-      // Load available markets
-      const markets = await this.config.exchangeFactory.loadMarkets();
-      this.symbols = markets.map(m => m.symbol).sort();
-
-      this.config.logger('info', 'ConnectionManager: Markets loaded', {
-        totalSymbols: this.symbols.length,
+      this.config.logger('info', `ConnectionManager: Initializing`, {
+        exchange: this.config.exchange,
+        marketType: this.config.marketType,
       });
+
+      // Create proxy provider using factory
+      const proxyProvider = this.config.proxyProviderFactory({
+        exchange: this.config.exchange,
+        marketType: this.config.marketType,
+        localIps: this.config.localIps,
+        noProxy: this.config.noProxy,
+        logger: this.config.logger,
+      });
+
+      // Create adapter using factory
+      this.#adapter = this.config.adapterFactory({
+        exchange: this.config.exchange,
+        marketType: this.config.marketType,
+        logger: this.config.logger,
+        proxyProvider: proxyProvider,
+      });
+
+      this.#marketRegistry = new MarketRegistry({
+        logger: this.config.logger,
+      });
+
+      this.#redisWriter = new RedisWriter(this.config.redisService, {
+        redisBatching: this.config.redisBatching,
+        redisFlushMs: this.config.redisFlushMs,
+        redisMaxBatch: this.config.redisMaxBatch,
+        redisOnlyOnChange: this.config.redisOnlyOnChange,
+        redisMinIntervalMs: this.config.redisMinIntervalMs,
+        logger: this.config.logger,
+      });
+
+      this.#subscriptionEngine = new SubscriptionEngine(
+        this.#adapter,
+        this.#marketRegistry,
+        this.#redisWriter,
+        {
+          batchSize: this.config.batchSize,
+          subscriptionDelay: this.config.subscriptionDelay,
+          retryBaseDelayMs: this.config.retryBaseDelayMs,
+          retryMaxDelayMs: this.config.retryMaxDelayMs,
+          healthCheckIntervalMs: this.config.healthCheckIntervalMs,
+          healthCheckTimeoutMs: this.config.healthCheckTimeoutMs,
+          logger: this.config.logger,
+        }
+      );
+
+      // Initialize adapter
+      await this.#adapter.initialize();
+
+      // Load markets
+      await this.#marketRegistry.loadDesiredMarkets(this.#adapter);
+
+      // Add all desired symbols to active tracking
+      const desiredSymbols = Array.from(this.#marketRegistry.getDesiredSymbols());
+      this.#marketRegistry.addSymbols(desiredSymbols);
 
       // Create batches
-      this._createBatches();
+      this.#createBatches();
 
-      this.config.logger('info', 'ConnectionManager: Batches created', {
-        totalBatches: this.batches.length,
-        symbolsPerBatch: this.config.batchSize,
+      this.isInitialized = true;
+
+      this.config.logger('info', `ConnectionManager: Initialized`, {
+        symbols: this.#marketRegistry.getDesiredSymbols().size,
+        batches: this.#batches.length,
       });
     } catch (error) {
-      this.config.logger('error', 'ConnectionManager: Initialization failed', {
-        message: error.message,
+      this.config.logger('error', `ConnectionManager: Initialization failed`, {
+        error: error.message,
       });
       throw error;
     }
   }
 
   /**
-   * Create symbol batches based on batchSize
-   * @private
-   */
-  _createBatches() {
-    this.batches = [];
-    for (let i = 0; i < this.symbols.length; i += this.config.batchSize) {
-      const batch = this.symbols.slice(i, i + this.config.batchSize);
-      this.batches.push(batch);
-    }
-  }
-
-  /**
-   * Start subscription loops for all batches
-   * @returns {Promise<void>}
+   * Start subscriptions
    */
   async startSubscriptions() {
+    if (!this.isInitialized) {
+      throw new Error('ConnectionManager not initialized - call initialize() first');
+    }
+
     if (this.isRunning) {
-      this.config.logger('warn', 'ConnectionManager: Already running');
+      this.config.logger('warn', `ConnectionManager: Already running`);
       return;
     }
 
-    if (!this.exchange) {
-      throw new Error('ConnectionManager: Not initialized. Call initialize() first.');
-    }
-
-    this.isRunning = true;
-
-    this.config.logger('info', 'ConnectionManager: Starting subscriptions', {
-      batches: this.batches.length,
-    });
-
-    // Start subscription loop for each batch
-    for (let i = 0; i < this.batches.length; i++) {
-      const batch = this.batches[i];
-      const batchId = `batch-${i}`;
-
-      // Stagger batch starts to avoid thundering herd
-      const delay = i * 100; // 100ms between batch starts
-      const timer = setTimeout(() => {
-        this._subscriptionLoop(batchId, batch);
-      }, delay);
-
-      this.subscriptionTimers.push(timer);
-    }
-
-    // Phase 5: Start global health check timer (runs every 10 seconds)
-    this.healthCheckInterval = setInterval(() => {
-      this._healthCheck();
-    }, 10000);
-
-    this.config.logger('info', 'ConnectionManager: Health check timer started (10s interval)');
-  }
-
-  /**
-   * Subscription loop for a single batch with Phase 5 resilience
-   * INTERNAL: Runs in background as a fire-and-forget async task
-   * @private
-   */
-  async _subscriptionLoop(batchId, symbols) {
     try {
-      this.stats.batchesStarted++;
-      this.config.logger('info', `ConnectionManager: Subscription loop started [${batchId}]`, {
-        symbols: symbols.length,
+      // Register callbacks on subscription engine
+      this.#subscriptionEngine.onTicker((symbol, ticker) => {
+        // Tickers already handled by RedisWriter internally
       });
 
-      // Start health check for this batch
-      this._startHealthCheck(batchId);
-
-      // Initialize batch state for health checks
-      // Use a future timestamp to give watchTickers time to establish connection
-      // (can take 60+ seconds for 100+ symbols to connect and receive first data)
-      this.batchState.set(batchId, {
-        lastMessageAt: Date.now() + (this.config.healthCheckTimeoutMs || 60000) + 30000, // +30s grace
-        stale: false,
+      this.#subscriptionEngine.onError((batchId, error) => {
+        this.config.logger('debug', `ConnectionManager: Subscription error [${batchId}]`, {
+          error: error.message,
+        });
       });
 
-      // Main subscription loop
-      while (this.isRunning) {
-        try {
-          // Filter out non-retryable symbols
-          const activeSymbols = symbols.filter(s => !this.nonRetryableSymbols.has(s));
+      // Start subscription engine with current batches
+      await this.#subscriptionEngine.startSubscriptions(this.#batches);
+      this.isRunning = true;
 
-          if (activeSymbols.length === 0) {
-            this.config.logger('warn', `ConnectionManager: All symbols non-retryable [${batchId}]`);
-            await this._sleep(5000);
-            continue;
-          }
-
-          // Watch tickers for this batch via CCXT Pro
-          const tickers = await this.exchange.watchTickers(activeSymbols);
-
-          if (!this.isRunning) {
-            break;
-          }
-
-          // Reset retry counter on successful connection
-          this.retryAttempts.set(batchId, 0);
-
-          // ✅ Phase 5: Update batch state - CRITICAL for health checks
-          // Updates timestamp when data ACTUALLY arrives (not on initialization)
-          const batchState = this.batchState.get(batchId);
-          if (batchState) {
-            batchState.lastMessageAt = Date.now();
-            batchState.stale = false;  // Reset stale flag on successful data
-          }
-          this.lastMessageTime.set(batchId, Date.now());
-
-          // Ticker data: {symbol: rawTickerData, ...}
-          if (tickers && typeof tickers === 'object') {
-            for (const [symbol, rawTicker] of Object.entries(tickers)) {
-              try {
-                // Normalize ticker data
-                const normalized = this.config.exchangeFactory.normalizeTicker(
-                  symbol,
-                  rawTicker
-                );
-
-                if (normalized) {
-                  // Persist to Redis
-                  const exchangeName = this.config.exchangeFactory.config.exchange;
-                  const marketType = this.config.exchangeFactory.config.marketType;
-
-                  await this.config.redisService.updateTicker(
-                    exchangeName,
-                    marketType,
-                    symbol,
-                    normalized
-                  );
-
-                  this.stats.totalUpdates++;
-                }
-              } catch (error) {
-                this.stats.normalizationErrors++;
-                this.config.logger('error',
-                  `ConnectionManager: Normalization error [${batchId}]`,
-                  { symbol, message: error.message }
-                );
-              }
-            }
-          }
-        } catch (error) {
-          this.stats.failedUpdates++;
-
-          // Log full error details for debugging
-          this.config.logger('debug', `ConnectionManager: Error caught [${batchId}]`, {
-            errorName: error.name,
-            errorCode: error.code,
-            errorMessage: error.message,
-            fullError: error.toString(),
-          });
-
-          // Phase 5: Check for non-retryable errors
-          if (this._isNonRetryableError(error)) {
-            this._handleNonRetryableError(batchId, error);
-            continue; // Skip exponential backoff for non-retryable errors
-          }
-
-          // Phase 5: Apply exponential backoff
-          const delayMs = this._calculateExponentialBackoff(batchId);
-          this.stats.exponentialBackoffs++;
-
-          this.config.logger('warn',
-            `ConnectionManager: Exponential backoff [${batchId}]`,
-            { delayMs, attempt: this.retryAttempts.get(batchId) }
-          );
-
-          // Wait before retrying
-          if (this.isRunning) {
-            await this._sleep(delayMs);
-          }
-        }
-      }
-
-      this.config.logger('info', `ConnectionManager: Subscription loop stopped [${batchId}]`);
+      this.config.logger('info', `ConnectionManager: Subscriptions started`);
     } catch (error) {
-      this.config.logger('error',
-        `ConnectionManager: Subscription loop fatal error [${batchId}]`,
-        { message: error.message }
-      );
-    } finally {
-      // Cleanup health check for this batch
-      this._stopHealthCheck(batchId);
-      this.batchState.delete(batchId);
+      this.config.logger('error', `ConnectionManager: Start subscriptions failed`, {
+        error: error.message,
+      });
+      throw error;
     }
   }
 
   /**
-   * Phase 5: Calculate exponential backoff delay
-   * Formula: baseDelay * (2 ^ attemptCount), capped at maxDelay
-   * @private
-   */
-  _calculateExponentialBackoff(batchId) {
-    const attempt = (this.retryAttempts.get(batchId) || 0) + 1;
-    this.retryAttempts.set(batchId, attempt);
-    this.stats.retries++;
-
-    // Formula: baseDelay * (2 ^ attempt)
-    const delay = this.config.retryBaseDelayMs * Math.pow(2, attempt - 1);
-
-    // Cap at max delay
-    const cappedDelay = Math.min(delay, this.config.retryMaxDelayMs);
-
-    return cappedDelay;
-  }
-
-  /**
-   * Phase 5: Detect non-retryable errors (delisted, invalid, not found)
-   * @private
-   */
-  _isNonRetryableError(error) {
-    if (!error || !error.message) {
-      return false;
-    }
-
-    const message = error.message.toLowerCase();
-    const errorName = (error.name || '').toLowerCase();
-
-    // Pattern matching for permanent failures
-    const nonRetryablePatterns = [
-      // Standard patterns
-      'not found',
-      'invalid',
-      'delisted',
-      'disabled',
-      'suspended',
-      '404',
-      '400',
-      'bad request',
-      'symbol not found',
-      'market not found',
-      // CCXT specific patterns for invalid symbols
-      'badsymbol',
-      'does not have market',
-      'unknown symbol',
-      'invalid symbol',
-      'symbol is not supported',
-      'market is not active',
-      'no such market',
-      'trading not allowed',
-      'pair not found',
-      'no permission',
-    ];
-
-    // Check message patterns
-    const matchesMessage = nonRetryablePatterns.some(pattern => message.includes(pattern));
-
-    // Check error name (CCXT exceptions)
-    const matchesName = errorName.includes('badsymbol') ||
-                        errorName.includes('notfound') ||
-                        errorName.includes('http400') ||
-                        errorName.includes('http404') ||
-                        errorName.includes('permissiondenied');
-
-    return matchesMessage || matchesName;
-  }
-
-  /**
-   * Phase 5: Handle non-retryable error - mark symbol as permanently failed
-   * Extracts symbol from error message and adds to non-retryable set
-   * @private
-   */
-  _handleNonRetryableError(batchId, error) {
-    this.stats.nonRetryableDetected++;
-
-    // Try to extract symbol from error message
-    const symbol = this._extractSymbolFromError(error);
-
-    if (symbol) {
-      this.nonRetryableSymbols.add(symbol);
-
-      // ✅ UPDATE MAIN BATCH STATE: Remove from this.batches so tests/externals see the change
-      const batchIndex = parseInt(batchId.split('-')[1], 10);
-      if (!isNaN(batchIndex) && this.batches[batchIndex]) {
-        if (Array.isArray(this.batches[batchIndex])) {
-          // batches is array of arrays
-          this.batches[batchIndex] = this.batches[batchIndex].filter(s => s !== symbol);
-        } else if (this.batches[batchIndex] && Array.isArray(this.batches[batchIndex].symbols)) {
-          // batches is array of objects with .symbols property
-          this.batches[batchIndex].symbols = this.batches[batchIndex].symbols.filter(s => s !== symbol);
-        }
-      }
-
-      this.config.logger('warn',
-        `ConnectionManager: Symbol marked non-retryable [${batchId}]`,
-        { symbol, message: error.message }
-      );
-    } else {
-      this.config.logger('warn',
-        `ConnectionManager: Non-retryable error [${batchId}]`,
-        { message: error.message }
-      );
-    }
-  }
-
-  /**
-   * Phase 5: Extract symbol from error message
-   * Looks for patterns like "BTC/USDT" in error messages
-   * @private
-   */
-  _extractSymbolFromError(error) {
-    if (!error || !error.message) {
-      return null;
-    }
-
-    const message = error.message;
-
-    // Pattern 1: Direct symbol mention (e.g., "BTC/USDT not found")
-    const match = message.match(/([A-Z0-9]+\/[A-Z0-9]+)/);
-    if (match) {
-      return match[1];
-    }
-
-    // Pattern 2: symbol= format (e.g., "invalid symbol='FAKE/USDT'")
-    const match2 = message.match(/symbol=['"]([A-Z0-9]+\/[A-Z0-9]+)['"]/i);
-    if (match2) {
-      return match2[1];
-    }
-
-    return null;
-  }
-
-  /**
-   * Phase 5: Global health check - runs every 10 seconds
-   * Detects stale connections (no messages for 60+ seconds)
-   * @private
-   */
-  _healthCheck() {
-    if (!this.isRunning) {
-      return;
-    }
-
-    // Check all active batches
-    for (const [batchId, batchState] of this.batchState.entries()) {
-      if (!batchState) continue;
-
-      const timeSinceLastMessage = Date.now() - batchState.lastMessageAt;
-      const staleThreshold = this.config.healthCheckTimeoutMs || 60000;
-
-      // Detect stale connection (no data for > 60 seconds)
-      if (timeSinceLastMessage > staleThreshold && !batchState.stale) {
-        batchState.stale = true;  // Mark as stale to avoid duplicate logs
-        this.stats.staleConnectionsDetected++;
-
-        this.config.logger('warn',
-          `ConnectionManager: Stale connection detected [${batchId}]`,
-          {
-            timeSinceLastMessage: `${(timeSinceLastMessage / 1000).toFixed(1)}s`,
-            threshold: `${(staleThreshold / 1000).toFixed(1)}s`,
-          }
-        );
-
-        // Force reconnect by closing current exchange connection
-        // This will cause watchTickers to fail and trigger exponential backoff
-        if (this.exchange && this.exchange.close) {
-          this.exchange.close().catch(() => {
-            // Silently ignore errors from close
-          });
-        }
-      }
-
-      // Reset stale flag if data is flowing again
-      if (timeSinceLastMessage <= staleThreshold && batchState.stale) {
-        batchState.stale = false;
-        this.config.logger('info', `ConnectionManager: Connection recovered [${batchId}]`);
-      }
-    }
-  }
-
-  /**
-   * Phase 5: Initialize health check for a batch (sets initial timestamp)
-   * @private
-   */
-  _startHealthCheck(batchId) {
-    // Initialize last message time
-    this.lastMessageTime.set(batchId, Date.now());
-  }
-
-  /**
-   * Phase 5: Stop health check timer for a batch
-   * @private
-   */
-  _stopHealthCheck(batchId) {
-    this.lastMessageTime.delete(batchId);
-  }
-
-  /**
-   * Stop all subscription loops and cleanup
-   * @returns {Promise<void>}
+   * Stop subscriptions and cleanup
    */
   async stop() {
-    this.isRunning = false;
+    if (!this.isRunning) return;
 
-    this.config.logger('info', 'ConnectionManager: Stopping subscriptions');
-
-    // Clear global health check timer
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-      this.healthCheckInterval = null;
-    }
-
-    // Clear subscription timers
-    for (const timer of this.subscriptionTimers) {
-      clearTimeout(timer);
-    }
-    this.subscriptionTimers = [];
-
-    // Phase 5: Clear health check timers
-    for (const timer of this.healthCheckTimers.values()) {
-      clearInterval(timer);
-    }
-    this.healthCheckTimers.clear();
-
-    // Flush Redis batch
     try {
-      await this.config.redisService.flush();
+      this.config.logger('info', `ConnectionManager: Stopping`);
+
+      this.isRunning = false;
+
+      // Stop subscription engine
+      if (this.#subscriptionEngine) {
+        await this.#subscriptionEngine.stopSubscriptions();
+      }
+
+      // Flush Redis
+      if (this.#redisWriter) {
+        await this.#redisWriter.flush();
+      }
+
+      this.config.logger('info', `ConnectionManager: Stopped`);
     } catch (error) {
-      this.config.logger('error', 'ConnectionManager: Final Redis flush failed', {
-        message: error.message,
+      this.config.logger('error', `ConnectionManager: Stop failed`, {
+        error: error.message,
       });
+      throw error;
+    }
+  }
+
+  /**
+   * Refresh markets and reallocate symbols
+   */
+  async refreshMarkets() {
+    if (!this.isInitialized) {
+      throw new Error('ConnectionManager not initialized');
     }
 
-    // Close exchange connections
-    if (this.exchange && this.exchange.close) {
-      try {
-        await this.exchange.close();
-      } catch (error) {
-        this.config.logger('error', 'ConnectionManager: Exchange close failed', {
-          message: error.message,
+    try {
+      this.config.logger('debug', `ConnectionManager: Refreshing markets`);
+
+      // Get previous state for diffing
+      const previousState = {
+        desiredSymbols: this.#marketRegistry.getDesiredSymbols(),
+      };
+
+      // Load fresh markets
+      await this.#marketRegistry.loadDesiredMarkets(this.#adapter);
+
+      // Detect changes
+      const { added, removed } = this.#marketRegistry.getDiffSince(previousState);
+
+      if (added.length > 0) {
+        this.#marketRegistry.addSymbols(added);
+        this.#createBatches(); // Recalculate batches
+        this.config.logger('info', `ConnectionManager: New symbols detected`, {
+          count: added.length,
         });
       }
+
+      if (removed.length > 0) {
+        this.#marketRegistry.removeSymbols(removed);
+        this.#createBatches(); // Recalculate batches
+        this.config.logger('info', `ConnectionManager: Removed symbols detected`, {
+          count: removed.length,
+        });
+      }
+
+      // Rewire live subscriptions to new batch topology.
+      if ((added.length > 0 || removed.length > 0) && this.isRunning) {
+        await this.#subscriptionEngine.stopSubscriptions();
+        if (this.#batches.length > 0) {
+          await this.#subscriptionEngine.startSubscriptions(this.#batches);
+        } else {
+          this.isRunning = false;
+        }
+      }
+
+      return { added, removed };
+    } catch (error) {
+      this.config.logger('warn', `ConnectionManager: Market refresh error`, {
+        error: error.message,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Create batches from currently tracked symbols
+   * This is a private method - called internally only
+   */
+  #createBatches() {
+    const activeSymbols = Array.from(this.#marketRegistry.getActiveSymbols()).sort();
+    this.#batches = [];
+
+    for (let i = 0; i < activeSymbols.length; i += this.config.batchSize) {
+      const batch = activeSymbols.slice(i, i + this.config.batchSize);
+      this.#batches.push(batch);
     }
 
-    // Phase 5: Clear resilience state
-    this.retryAttempts.clear();
-    this.nonRetryableSymbols.clear();
-    this.lastMessageTime.clear();
-    this.batchState.clear();
+    // Allocate to registry for internal tracking
+    const batchIds = this.#batches.map((_, i) => `batch-${i}`);
+    this.#marketRegistry.allocateToBatches(batchIds);
 
-    this.config.logger('info', 'ConnectionManager: Stopped', {
-      stats: this.stats,
+    this.config.logger('debug', `ConnectionManager: Batches created`, {
+      batches: this.#batches.length,
+      symbolsPerBatch: Math.ceil(activeSymbols.length / this.#batches.length || 1),
     });
   }
 
   /**
-   * Get service status
-   * @returns {Object}
+   * PUBLIC GETTER - Get adapter (read-only proxy for tests/inspection only)
+   * Returns a read-only proxy to prevent accidental mutations
    */
-  getStatus() {
-    return {
-      isRunning: this.isRunning,
-      symbols: this.symbols.length,
-      batches: this.batches.length,
-      subscriptionTimers: this.subscriptionTimers.length,
-      nonRetryableSymbols: this.nonRetryableSymbols.size,
-      stats: { ...this.stats },
-    };
+  get adapter() {
+    if (!this.#adapter) return null;
+    return new Proxy(this.#adapter, {
+      set: () => {
+        throw new Error('Cannot mutate adapter - component reference is read-only');
+      },
+      defineProperty: () => {
+        throw new Error('Cannot define properties on adapter - component reference is read-only');
+      },
+      deleteProperty: () => {
+        throw new Error('Cannot delete properties on adapter - component reference is read-only');
+      },
+    });
   }
 
   /**
-   * Sleep helper
-   * @private
+   * PUBLIC GETTER - Get subscription engine (read-only proxy)
    */
-  _sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  get subscriptionEngine() {
+    if (!this.#subscriptionEngine) return null;
+    return new Proxy(this.#subscriptionEngine, {
+      set: () => {
+        throw new Error('Cannot mutate subscriptionEngine - component reference is read-only');
+      },
+      defineProperty: () => {
+        throw new Error('Cannot define properties on subscriptionEngine - component reference is read-only');
+      },
+      deleteProperty: () => {
+        throw new Error('Cannot delete properties on subscriptionEngine - component reference is read-only');
+      },
+    });
+  }
+
+  /**
+   * PUBLIC GETTER - Get market registry (read-only proxy)
+   */
+  get marketRegistry() {
+    if (!this.#marketRegistry) return null;
+    return new Proxy(this.#marketRegistry, {
+      set: () => {
+        throw new Error('Cannot mutate marketRegistry - component reference is read-only');
+      },
+      defineProperty: () => {
+        throw new Error('Cannot define properties on marketRegistry - component reference is read-only');
+      },
+      deleteProperty: () => {
+        throw new Error('Cannot delete properties on marketRegistry - component reference is read-only');
+      },
+    });
+  }
+
+  /**
+   * PUBLIC GETTER - Get redis writer (read-only proxy)
+   */
+  get redisWriter() {
+    if (!this.#redisWriter) return null;
+    return new Proxy(this.#redisWriter, {
+      set: () => {
+        throw new Error('Cannot mutate redisWriter - component reference is read-only');
+      },
+      defineProperty: () => {
+        throw new Error('Cannot define properties on redisWriter - component reference is read-only');
+      },
+      deleteProperty: () => {
+        throw new Error('Cannot delete properties on redisWriter - component reference is read-only');
+      },
+    });
+  }
+
+  /**
+   * PUBLIC GETTER - Get batches array (immutable - returns fresh copy)
+   */
+  get batches() {
+    return [...this.#batches];
+  }
+
+  /**
+   * Get active symbol count
+   */
+  getSymbolCount() {
+    return this.#marketRegistry?.getActiveSymbols()?.size || 0;
+  }
+
+  /**
+   * Get batch count
+   */
+  getBatchCount() {
+    return this.#batches.length;
+  }
+
+  /**
+   * Get active symbols (fresh copy)
+   */
+  getActiveSymbols() {
+    const symbols = this.#marketRegistry?.getActiveSymbols() || new Set();
+    return new Set(symbols);
+  }
+
+  /**
+   * Get status
+   */
+  getStatus() {
+    const adapterMetrics = this.#adapter?.getMetrics() || {};
+    const engineStatus = this.#subscriptionEngine?.getStatus() || {};
+    const registryMetrics = this.#marketRegistry?.getMetrics() || {};
+    const writerMetrics = this.#redisWriter?.getMetrics() || {};
+
+    return {
+      isInitialized: this.isInitialized,
+      isRunning: this.isRunning,
+      exchange: this.config.exchange,
+      marketType: this.config.marketType,
+      symbolCount: registryMetrics.activeCount || 0,
+      batches: this.#batches.length,
+      adapter: adapterMetrics,
+      engine: engineStatus,
+      registry: registryMetrics,
+      writer: writerMetrics,
+    };
   }
 }
 

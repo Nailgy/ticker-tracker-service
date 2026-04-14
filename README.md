@@ -11,6 +11,22 @@ Real-time exchange ticker tracking service built with Node.js, CCXT Pro, and Red
 - ✅ Configuration validation & sanitization
 - ⏳ Phase 2: Core modules (TickerWatcher, ConnectionManager, etc.)
 
+## 📚 Documentation
+
+**Phase 1 Complete** - Comprehensive documentation available:
+
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - System design, module map, data flows, dependency hierarchy
+- **[API_REFERENCE.md](docs/API_REFERENCE.md)** - Complete public API documentation for all 17 modules
+- **[DEPLOYMENT.md](docs/DEPLOYMENT.md)** - Production setup, health checks, monitoring, performance tuning
+- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** - Error diagnosis, common issues, solutions
+- **[DEVELOPMENT.md](docs/DEVELOPMENT.md)** - Contributing guidelines, testing patterns, code standards
+- **[PHASE_1_VERIFICATION.md](docs/PHASE_1_VERIFICATION.md)** - Verification checklist, test coverage, sign-off
+- **[PHASE_1_CONTRACT_FIXES.md](docs/PHASE_1_CONTRACT_FIXES.md)** - Contract violation fixes applied during code review
+
+**For more details:**
+- See [PHASE_1_DETAILED_ROADMAP.md](docs/PHASE_1_DETAILED_ROADMAP.md) for architecture evolution
+- See phase-specific docs (PHASE_4.md, PHASE_5.md) for resilience & market discovery
+
 ## 🚀 Quick Start
 
 ### Prerequisites

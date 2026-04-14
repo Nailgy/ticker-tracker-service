@@ -1,13 +1,12 @@
 /**
- * ProxyService & ExchangeFactory - Unit Tests
+ * ⚠️  DEPRECATED: ProxyService & ExchangeFactory Tests
  *
- * Tests proxy rotation, exchange instance creation, and ticker normalization
- * using mocked CCXT to avoid external dependencies.
+ * These tests are for deprecated modules only.
+ * They are skipped since the modules now throw deprecation errors on instantiation.
+ *
+ * See PHASE_1_CONTRACT_FIXES.md for migration to new architecture.
+ * TODO: Remove this file in v2.0.
  */
-
-const ProxyService = require('../../src/services/proxy.service');
-const ExchangeFactory = require('../../src/services/exchange.factory.js');
-const https = require('https');
 
 // Mock https.Agent
 jest.mock('https', () => ({
@@ -60,7 +59,8 @@ jest.mock('ccxt', () => ({
   },
 }));
 
-const ccxt = require('ccxt');
+// Tests disabled - testing deprecated modules that now block all access
+describe.skip('ProxyService & ExchangeFactory (Deprecated)', () => {
 
 describe('ProxyService', () => {
   let proxyService;
@@ -541,3 +541,4 @@ describe('ExchangeFactory', () => {
     });
   });
 });
+}); // End of describe.skip

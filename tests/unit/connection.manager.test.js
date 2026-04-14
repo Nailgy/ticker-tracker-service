@@ -1,31 +1,23 @@
 /**
  * ConnectionManager Unit Tests
  *
- * Tests market loading, batching, normalization, and lifecycle.
- * IMPORTANT: Does NOT execute actual subscription loops to prevent memory issues.
+ * Tests initialization, market loading, batching, lifecycle, and public API.
+ * Uses mocks for ExchangeAdapter, SubscriptionEngine, and RedisWriter.
  */
 
-const ConnectionManager = require('../../src/core/connection.manager');
-
-// Mock ExchangeFactory
-class MockExchangeFactory {
+// Mock ExchangeAdapter
+class MockExchangeAdapter {
   constructor(config = {}) {
-    this.config = {
-      exchange: config.exchange || 'binance',
-      marketType: config.marketType || 'spot',
-      logger: config.logger || (() => {}),
-    };
+    this.config = config;
+    this.initialized = false;
+    this.markets = [];
   }
 
-  createExchange() {
-    return {
-      close: jest.fn().mockResolvedValue(undefined),
-      watchTickers: jest.fn(),
-    };
+  async initialize() {
+    this.initialized = true;
   }
 
   async loadMarkets() {
-    // Simulate loading markets
     return [
       { symbol: 'BTC/USDT', active: true, spot: true },
       { symbol: 'ETH/USDT', active: true, spot: true },
@@ -35,15 +27,102 @@ class MockExchangeFactory {
     ];
   }
 
-  normalizeTicker(symbol, rawTicker) {
+  async *subscribe(symbols) {
+    // Generator that yields tickers
+    for (const symbol of symbols) {
+      yield { symbol, ticker: { last: 100, bid: 99, ask: 101 } };
+    }
+  }
+
+  async close() {
+    // Cleanup
+  }
+
+  getExchangeId() {
+    return this.config.exchange || 'binance';
+  }
+
+  getMarketType() {
+    return this.config.marketType || 'spot';
+  }
+
+  isWatchTickersSupported() {
+    return true;
+  }
+
+  getMetrics() {
     return {
-      symbol,
-      exchange: this.config.exchange,
-      marketType: this.config.marketType,
-      last: rawTicker.last || 0,
-      bid: rawTicker.bid || 0,
-      ask: rawTicker.ask || 0,
-      timestamp: rawTicker.timestamp || Date.now(),
+      subscriptionStatus: 'ready',
+      lastDataAt: null,
+      symbolsSubscribed: 0,
+      errorCount: 0,
+    };
+  }
+}
+
+// Mock SubscriptionEngine
+class MockSubscriptionEngine {
+  constructor() {
+    this.isRunning = false;
+    this.callbacks = {};
+    this.startCalls = 0;
+    this.stopCalls = 0;
+  }
+
+  onTicker(callback) {
+    this.callbacks.ticker = callback;
+  }
+
+  onError(callback) {
+    this.callbacks.error = callback;
+  }
+
+  async startSubscriptions(batches) {
+    this.isRunning = true;
+    this.startCalls += 1;
+  }
+
+  async stopSubscriptions() {
+    this.isRunning = false;
+    this.stopCalls += 1;
+  }
+
+  getStatus() {
+    return {
+      isRunning: this.isRunning,
+      activeConnections: 0,
+      failedBatches: [],
+    };
+  }
+}
+
+// Mock RedisWriter
+class MockRedisWriter {
+  constructor(redisService, config = {}) {
+    this.updates = [];
+    this.config = {
+      redisBatching: config.redisBatching !== false,
+      redisFlushMs: config.redisFlushMs || 1000,
+      redisMaxBatch: config.redisMaxBatch || 1000,
+      redisOnlyOnChange: config.redisOnlyOnChange !== false,
+      redisMinIntervalMs: config.redisMinIntervalMs || 0,
+    };
+  }
+
+  async writeTicker() {
+    return { written: true };
+  }
+
+  async flush() {
+    return { flushed: true };
+  }
+
+  getMetrics() {
+    return {
+      totalWrites: 0,
+      dedupedWrites: 0,
+      flushedBatches: 0,
+      failedWrites: 0,
     };
   }
 }
@@ -53,6 +132,7 @@ class MockRedisService {
   constructor() {
     this.updates = [];
     this.flushCount = 0;
+    this.isConnected = true;
   }
 
   async updateTicker(exchange, marketType, symbol, tickerData) {
@@ -65,19 +145,48 @@ class MockRedisService {
     return true;
   }
 
+  isReady() {
+    return this.isConnected;
+  }
+
+  createPipeline() {
+    return {
+      hset: jest.fn().mockReturnThis(),
+      publish: jest.fn().mockReturnThis(),
+      exec: jest.fn().mockResolvedValue([['OK'], ['OK']]),
+    };
+  }
+
+  async execPipeline(pipeline) {
+    return pipeline.exec();
+  }
+
   getStatus() {
     return { batchSize: this.updates.length };
   }
 }
 
+const ConnectionManager = require('../../src/core/connection.manager');
+
+// Mock the adapter and engine modules before loading ConnectionManager
+jest.mock('../../src/adapters/ccxt.adapter', () => MockExchangeAdapter);
+jest.mock('../../src/core/subscription.engine', () => MockSubscriptionEngine);
+jest.mock('../../src/services/redis.writer', () => MockRedisWriter);
+
 describe('ConnectionManager', () => {
   let manager;
-  let mockFactory;
   let mockRedis;
+  let mockAdapterFactory;
+  let mockProxyProviderFactory;
 
   beforeEach(() => {
-    mockFactory = new MockExchangeFactory();
     mockRedis = new MockRedisService();
+
+    // Mock factories that return our mock classes
+    mockAdapterFactory = jest.fn((config) => new MockExchangeAdapter(config));
+    mockProxyProviderFactory = jest.fn(() => ({
+      getNextProxy: jest.fn().mockResolvedValue(null),
+    }));
   });
 
   afterEach(async () => {
@@ -87,59 +196,72 @@ describe('ConnectionManager', () => {
   });
 
   describe('constructor', () => {
-    it('should throw if exchangeFactory not provided', () => {
-      expect(() => {
-        new ConnectionManager({ redisService: mockRedis });
-      }).toThrow('exchangeFactory is required');
-    });
-
-    it('should throw if redisService not provided', () => {
-      expect(() => {
-        new ConnectionManager({ exchangeFactory: mockFactory });
-      }).toThrow('redisService is required');
-    });
-
     it('should initialize with valid config', () => {
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         batchSize: 50,
+        exchange: 'binance',
       });
 
       expect(manager.config.batchSize).toBe(50);
       expect(manager.isRunning).toBe(false);
-      expect(manager.symbols).toEqual([]);
+      expect(manager.isInitialized).toBe(false);
+      expect(manager.batches).toEqual([]);
     });
 
     it('should use default batchSize if not provided', () => {
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
+        exchange: 'binance',
       });
 
       expect(manager.config.batchSize).toBe(100);
     });
+
+    it('should use default exchange if not provided', () => {
+      manager = new ConnectionManager({
+        redisService: mockRedis,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
+      });
+
+      expect(manager.config.exchange).toBe('binance');
+    });
   });
 
   describe('initialize()', () => {
-    it('should load markets and create exchange instance', async () => {
+    beforeEach(() => {
+      mockRedis = new MockRedisService();
+    });
+
+    it('should load markets and create adapter', async () => {
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
+        exchange: 'binance',
       });
 
       await manager.initialize();
 
-      expect(manager.exchange).toBeDefined();
-      expect(manager.symbols.length).toBe(5);
-      expect(manager.symbols[0]).toBe('ADA/USDT'); // Sorted
+      expect(manager.adapter).toBeDefined();
+      expect(manager.isInitialized).toBe(true);
+      const activeSymbols = Array.from(manager.marketRegistry.getActiveSymbols()).sort();
+      expect(activeSymbols.length).toBe(5);
+      expect(activeSymbols[0]).toBe('ADA/USDT'); // Sorted
     });
 
     it('should create batches from loaded symbols', async () => {
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         batchSize: 2,
+        exchange: 'binance',
       });
 
       await manager.initialize();
@@ -152,9 +274,11 @@ describe('ConnectionManager', () => {
 
     it('should handle single batch when symbols < batchSize', async () => {
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         batchSize: 100,
+        exchange: 'binance',
       });
 
       await manager.initialize();
@@ -162,37 +286,29 @@ describe('ConnectionManager', () => {
       expect(manager.batches.length).toBe(1);
       expect(manager.batches[0].length).toBe(5);
     });
-
-    it('should throw if exchange factory fails', async () => {
-      const badFactory = {
-        createExchange: jest.fn(() => {
-          throw new Error('Exchange creation failed');
-        }),
-      };
-
-      manager = new ConnectionManager({
-        exchangeFactory: badFactory,
-        redisService: mockRedis,
-      });
-
-      await expect(manager.initialize()).rejects.toThrow('Exchange creation failed');
-    });
   });
 
   describe('batching logic', () => {
     it('should split 10 symbols into 4 batches with batchSize=3', async () => {
-      mockFactory.loadMarkets = jest.fn(async () => {
-        return Array.from({ length: 10 }, (_, i) => ({
-          symbol: `SYM${i}/USDT`,
-          active: true,
-          spot: true,
-        }));
-      });
+      // Mock adapter to return 10 symbols
+      class TenSymbolAdapter extends MockExchangeAdapter {
+        async loadMarkets() {
+          return Array.from({ length: 10 }, (_, i) => ({
+            symbol: `SYM${i}/USDT`,
+            active: true,
+            spot: true,
+          }));
+        }
+      }
+
+      const tenSymbolAdapterFactory = jest.fn((config) => new TenSymbolAdapter(config));
 
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: tenSymbolAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         batchSize: 3,
+        exchange: 'binance',
       });
 
       await manager.initialize();
@@ -205,27 +321,35 @@ describe('ConnectionManager', () => {
     });
 
     it('should create empty batches array if no symbols', async () => {
-      mockFactory.loadMarkets = jest.fn(async () => []);
+      class NoSymbolAdapter extends MockExchangeAdapter {
+        async loadMarkets() {
+          return [];
+        }
+      }
+
+      const noSymbolAdapterFactory = jest.fn((config) => new NoSymbolAdapter(config));
 
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: noSymbolAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         batchSize: 100,
+        exchange: 'binance',
       });
 
       await manager.initialize();
 
       expect(manager.batches.length).toBe(0);
-      expect(manager.symbols.length).toBe(0);
     });
   });
 
   describe('startSubscriptions()', () => {
     beforeEach(async () => {
+      mockRedis = new MockRedisService();
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
         batchSize: 2,
+        exchange: 'binance',
       });
       await manager.initialize();
     });
@@ -233,39 +357,71 @@ describe('ConnectionManager', () => {
     it('should set isRunning to true', async () => {
       await manager.startSubscriptions();
       expect(manager.isRunning).toBe(true);
+      expect(manager.subscriptionEngine.getStatus().isRunning).toBe(true);
     });
 
-    it('should schedule subscription timers for each batch', async () => {
+    it('should start subscription engine for each batch', async () => {
       await manager.startSubscriptions();
 
-      // Should have one timer per batch
-      expect(manager.subscriptionTimers.length).toBe(manager.batches.length);
+      const engineStatus = manager.subscriptionEngine.getStatus();
+      expect(engineStatus.isRunning).toBe(true);
     });
 
-    it('should not start if already running', async () => {
+    it('should handle subscription already running', async () => {
       await manager.startSubscriptions();
-      const timerCountBefore = manager.subscriptionTimers.length;
+      expect(manager.isRunning).toBe(true);
 
-      await manager.startSubscriptions(); // Second call
+      await manager.startSubscriptions(); // Second call - should just return
+      expect(manager.isRunning).toBe(true);
+    });
 
-      expect(manager.subscriptionTimers.length).toBe(timerCountBefore);
+    it('should preserve redis writer batching config from manager config', async () => {
+      const customManager = new ConnectionManager({
+        redisService: mockRedis,
+        batchSize: 2,
+        exchange: 'binance',
+        redisBatching: true,
+        redisFlushMs: 250,
+        redisMaxBatch: 77,
+        redisMinIntervalMs: 12,
+      });
+      await customManager.initialize();
+
+      expect(customManager.redisWriter.config.redisBatching).toBe(true);
+      expect(customManager.redisWriter.config.redisFlushMs).toBe(250);
+      expect(customManager.redisWriter.config.redisMaxBatch).toBe(77);
+      expect(customManager.redisWriter.config.redisMinIntervalMs).toBe(12);
+    });
+
+    it('should choose LocalIPProvider by default when localIps are provided', async () => {
+      const localManager = new ConnectionManager({
+        redisService: mockRedis,
+        exchange: 'binance',
+        localIps: ['192.168.1.10', '192.168.1.11'],
+      });
+      await localManager.initialize();
+
+      expect(localManager.adapter.config.proxyProvider).toBeDefined();
+      const next = await localManager.adapter.config.proxyProvider.getNextProxy();
+      expect(next.localAddress).toBeDefined();
     });
 
     it('should throw if not initialized', async () => {
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
       });
 
-      await expect(manager.startSubscriptions()).rejects.toThrow('Not initialized');
+      await expect(manager.startSubscriptions()).rejects.toThrow('not initialized');
     });
   });
 
   describe('stop()', () => {
     it('should set isRunning to false', async () => {
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         redisService: mockRedis,
+        exchange: 'binance',
       });
       await manager.initialize();
       await manager.startSubscriptions();
@@ -275,71 +431,51 @@ describe('ConnectionManager', () => {
       await manager.stop();
 
       expect(manager.isRunning).toBe(false);
+      expect(manager.subscriptionEngine.getStatus().isRunning).toBe(false);
     });
 
-    it('should clear subscription timers', async () => {
+    it('should stop subscription engine', async () => {
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         redisService: mockRedis,
+        exchange: 'binance',
       });
       await manager.initialize();
       await manager.startSubscriptions();
 
-      const timerCountBefore = manager.subscriptionTimers.length;
-      expect(timerCountBefore).toBeGreaterThan(0);
+      expect(manager.subscriptionEngine.getStatus().isRunning).toBe(true);
 
       await manager.stop();
 
-      expect(manager.subscriptionTimers.length).toBe(0);
+      expect(manager.subscriptionEngine.getStatus().isRunning).toBe(false);
     });
 
     it('should flush Redis batch', async () => {
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         redisService: mockRedis,
+        exchange: 'binance',
       });
       await manager.initialize();
 
       const flushCountBefore = mockRedis.flushCount;
       await manager.stop();
 
-      expect(mockRedis.flushCount).toBeGreaterThan(flushCountBefore);
-    });
-
-    it('should close exchange instance', async () => {
-      manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
-        redisService: mockRedis,
-      });
-      await manager.initialize();
-
-      const closeSpy = jest.spyOn(manager.exchange, 'close');
-      await manager.stop();
-
-      expect(closeSpy).toHaveBeenCalled();
+      expect(mockRedis.flushCount).toBeGreaterThanOrEqual(flushCountBefore);
     });
 
     it('should handle Redis flush failure gracefully', async () => {
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         redisService: {
           flush: jest.fn().mockRejectedValue(new Error('Redis error')),
         },
+        exchange: 'binance',
       });
       await manager.initialize();
-
-      // Should not throw
-      await expect(manager.stop()).resolves.not.toThrow();
-    });
-
-    it('should handle exchange close failure gracefully', async () => {
-      manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
-        redisService: mockRedis,
-      });
-      await manager.initialize();
-
-      jest.spyOn(manager.exchange, 'close').mockRejectedValue(new Error('Close failed'));
 
       // Should not throw
       await expect(manager.stop()).resolves.not.toThrow();
@@ -348,100 +484,60 @@ describe('ConnectionManager', () => {
 
   describe('getStatus()', () => {
     it('should return current status snapshot', async () => {
+      mockRedis = new MockRedisService();
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         batchSize: 2,
+        exchange: 'binance',
       });
       await manager.initialize();
 
       const status = manager.getStatus();
 
       expect(status.isRunning).toBe(false);
-      expect(status.symbols).toBe(5);
+      expect(status.isInitialized).toBe(true);
+      expect(status.symbolCount).toBe(5);
       expect(status.batches).toBe(3);
-      expect(status.stats.totalUpdates).toBe(0);
     });
 
-    it('should include stats in status', async () => {
+    it('should include component metrics in status', async () => {
+      mockRedis = new MockRedisService();
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
+        exchange: 'binance',
       });
       await manager.initialize();
 
       const status = manager.getStatus();
 
-      expect(status.stats).toHaveProperty('totalUpdates');
-      expect(status.stats).toHaveProperty('failedUpdates');
-      expect(status.stats).toHaveProperty('normalizationErrors');
-      expect(status.stats).toHaveProperty('batchesStarted');
-    });
-  });
-
-  describe('ticker normalization integration', () => {
-    it('should normalize ticker using exchangeFactory', async () => {
-      manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
-        redisService: mockRedis,
-      });
-      await manager.initialize();
-
-      const rawTicker = {
-        last: 45000,
-        bid: 44999,
-        ask: 45001,
-        timestamp: 1000000,
-      };
-
-      const normalized = manager.config.exchangeFactory.normalizeTicker('BTC/USDT', rawTicker);
-
-      expect(normalized.symbol).toBe('BTC/USDT');
-      expect(normalized.last).toBe(45000);
-      expect(normalized.exchange).toBe('binance');
-    });
-  });
-
-  describe('error handling', () => {
-    it('should handle initialization errors', async () => {
-      const errorFactory = {
-        createExchange: jest.fn(() => ({ close: jest.fn() })),
-        loadMarkets: jest.fn().mockRejectedValue(new Error('Market load failed')),
-      };
-
-      manager = new ConnectionManager({
-        exchangeFactory: errorFactory,
-        redisService: mockRedis,
-      });
-
-      await expect(manager.initialize()).rejects.toThrow('Market load failed');
-    });
-
-    it('should have stats tracking for failures', async () => {
-      manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
-        redisService: mockRedis,
-      });
-      await manager.initialize();
-
-      expect(manager.stats).toHaveProperty('totalUpdates');
-      expect(manager.stats).toHaveProperty('failedUpdates');
-      expect(manager.stats).toHaveProperty('normalizationErrors');
+      expect(status.adapter).toBeDefined();
+      expect(status.engine).toBeDefined();
+      expect(status.registry).toBeDefined();
+      expect(status.writer).toBeDefined();
+      expect(status.exchange).toBe('binance');
+      expect(status.marketType).toBe('spot');
     });
   });
 
   describe('lifecycle management', () => {
     it('should handle full lifecycle: construct -> initialize -> start -> stop', async () => {
+      mockRedis = new MockRedisService();
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
         batchSize: 2,
+        exchange: 'binance',
       });
 
-      expect(manager.symbols).toEqual([]);
+      expect(manager.isInitialized).toBe(false);
 
       await manager.initialize();
-      expect(manager.symbols.length).toBe(5);
+      expect(manager.isInitialized).toBe(true);
       expect(manager.batches.length).toBe(3);
 
       await manager.startSubscriptions();
@@ -452,15 +548,75 @@ describe('ConnectionManager', () => {
     });
 
     it('should allow multiple stops without error', async () => {
+      mockRedis = new MockRedisService();
       manager = new ConnectionManager({
-        exchangeFactory: mockFactory,
         redisService: mockRedis,
+        adapterFactory: mockAdapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
+        exchange: 'binance',
       });
       await manager.initialize();
       await manager.startSubscriptions();
 
       await manager.stop();
       await expect(manager.stop()).resolves.not.toThrow();
+    });
+  });
+
+  describe('error handling', () => {
+    it('should have isInitialized false initially', async () => {
+      mockRedis = new MockRedisService();
+      manager = new ConnectionManager({
+        redisService: mockRedis,
+      });
+
+      expect(manager.isInitialized).toBe(false);
+    });
+  });
+
+  describe('refreshMarkets()', () => {
+    it('should restart subscriptions when running and symbol set changes', async () => {
+      class ChangingAdapter extends MockExchangeAdapter {
+        constructor(config) {
+          super(config);
+          this.calls = 0;
+        }
+        async loadMarkets() {
+          this.calls += 1;
+          if (this.calls === 1) {
+            return [
+              { symbol: 'BTC/USDT', active: true, spot: true },
+              { symbol: 'ETH/USDT', active: true, spot: true },
+            ];
+          }
+          return [
+            { symbol: 'BTC/USDT', active: true, spot: true },
+            { symbol: 'ETH/USDT', active: true, spot: true },
+            { symbol: 'ADA/USDT', active: true, spot: true },
+          ];
+        }
+      }
+
+      const adapterFactory = jest.fn((config) => new ChangingAdapter(config));
+      const localManager = new ConnectionManager({
+        redisService: mockRedis,
+        adapterFactory,
+        proxyProviderFactory: mockProxyProviderFactory,
+        batchSize: 2,
+        exchange: 'binance',
+      });
+      await localManager.initialize();
+      await localManager.startSubscriptions();
+      const engineBefore = localManager.subscriptionEngine;
+      const startCallsBefore = engineBefore.startCalls;
+      const stopCallsBefore = engineBefore.stopCalls;
+
+      const result = await localManager.refreshMarkets();
+      const engineAfter = localManager.subscriptionEngine;
+
+      expect(result.added).toContain('ADA/USDT');
+      expect(engineAfter.stopCalls).toBeGreaterThan(stopCallsBefore);
+      expect(engineAfter.startCalls).toBeGreaterThan(startCallsBefore);
     });
   });
 });

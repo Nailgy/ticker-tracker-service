@@ -1,12 +1,21 @@
 /**
- * ProxyService - Proxy Management & Rotation
+ * ⚠️  DEPRECATED: ProxyService
  *
- * Handles proxy list management and round-robin rotation for requests.
- * Supports multiple proxy providers or direct IP binding.
+ * This module is deprecated and no longer used in Phase 1 architecture.
+ * Its functionality has been replaced by:
+ * - ProxyProvider (src/services/proxy.provider.js) - Abstract interface
+ * - RoundRobinProvider - Round-robin proxy rotation
+ * - LocalIPProvider - Local IP binding via ProxyProvider
+ * - NoProxyProvider - Direct connection (no proxy)
  *
- * Usage:
- *   const proxyService = new ProxyService(['http://proxy1:8080', 'http://proxy2:8080']);
- *   const nextProxy = proxyService.getNextProxy();
+ * This file is retained for backwards compatibility only.
+ * DO NOT use in new code. Use ProxyProvider hierarchy instead.
+ *
+ * Migration guide:
+ * - Old: new ProxyService({proxies: List}).getNextProxy()
+ * - New: new RoundRobinProvider(proxyList, config).get NextProxy()
+ *
+ * ProxyProvider allows pluggable strategies and better error handling.
  */
 
 class ProxyService {

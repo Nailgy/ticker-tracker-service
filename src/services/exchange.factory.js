@@ -1,16 +1,24 @@
 /**
- * ExchangeFactory - CCXT Pro Exchange Instantiation & Normalization
+ * ⚠️  DEPRECATED: ExchangeFactory
  *
- * Responsible for:
- * - Creating CCXT Pro exchange instances with proper configuration
- * - Applying exchange-specific normalization rules to ticker payloads
- * - Supporting local IPv4 binding via https.Agent
- * - Managing market filtering and caching
+ * This module is deprecated and no longer used in Phase 1 architecture.
+ * Its functionality has been split across:
+ * - CCXTAdapter (src/adapters/ccxt.adapter.js) - CCXT instance creation
+ * - ProxyProvider (src/services/proxy.provider.js) - Proxy management
+ * - Strategies in src/adapters/strategies/*.js - Watch strategy patterns
  *
- * Usage:
- *   const factory = new ExchangeFactory({ exchange: 'binance', marketType: 'spot' });
- *   const exchangeInstance = factory.createExchange();
- *   const normalized = factory.normalizeTicker('BTC/USDT', rawTicker);
+ * This file is retained for backwards compatibility only.
+ * DO NOT use in new code. Use CCXTAdapter and ProxyProvider instead.
+ *
+ * Migration guide:
+ * - Old: new ExchangeFactory(...).createExchange()
+ * - New: Create CCXTAdapter and call initialize()
+ *
+ * - Old: factory.normalizeTicker(symbol, rawTicker)
+ * - New: Handled by adapter.subscribe() which yields pre-normalized tickers
+ *
+ * - Old: factory.loadMarkets()
+ * - New: adapter.loadMarkets() or use MarketRegistry
  */
 
 const https = require('https');

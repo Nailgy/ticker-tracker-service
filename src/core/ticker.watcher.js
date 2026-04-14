@@ -1,59 +1,55 @@
 /**
- * TickerWatcher - Top-Level Orchestrator
+ * TickerWatcher - Top-Level Orchestrator (Refactored)
  *
- * Glues together all components and manages the full application lifecycle:
- * - Initializes RedisService, ExchangeFactory, ConnectionManager
- * - Implements market discovery loop (periodic refresh, symbol diffing)
- * - Implements graceful shutdown (SIGINT/SIGTERM handlers)
- * - Manages symbol allocation to batches dynamically
+ * REFACTORED to:
+ * - Use ONLY public APIs of ConnectionManager
+ * - NO calls to private methods (_createBatches, _subscriptionLoop)
+ * - Delegate all subscription logic to ConnectionManager
+ * - Manage lifecycle and market discovery only
+ *
+ * Responsibilities:
+ * - Initialize all services
+ * - Start subscriptions
+ * - Coordinate market discovery loop
+ * - Implement graceful shutdown
+ * - Install signal handlers
  *
  * Usage:
  *   const watcher = new TickerWatcher(config);
- *   await watcher.start();
- *   // Stops on SIGINT/SIGTERM
+ *   await watcher.start();    // Blocks until SIGINT/SIGTERM
  */
 
-const RedisService = require('../services/redis.service');
-const ExchangeFactory = require('../services/exchange.factory');
 const ConnectionManager = require('./connection.manager');
+const RedisService = require('../services/redis.service');
 
 class TickerWatcher {
-  /**
-   * Initialize orchestrator
-   * @param {Object} config - Configuration object from buildConfig()
-   */
   constructor(config) {
     this.config = config;
     this.logger = config.logger || this._defaultLogger;
 
     // Services
     this.redisService = null;
-    this.exchangeFactory = null;
     this.connectionManager = null;
 
-    // Market tracking state
+    // Market tracking
     this.currentSymbols = new Set();
     this.marketRefreshTimer = null;
 
-    // Lifecycle state
+    // Lifecycle
     this.isRunning = false;
     this.isStopping = false;
   }
 
   /**
    * Default logger
-   * @private
    */
   _defaultLogger(level, message, data) {
     if (level === 'debug') return;
-    const prefix = `[TickerWatcher:${level.toUpperCase()}]`;
-    console.log(prefix, message, data ? JSON.stringify(data, null, 2) : '');
+    console.log(`[TickerWatcher:${level.toUpperCase()}] ${message}`, data || '');
   }
 
   /**
    * Start the orchestrator
-   * @returns {Promise<void>}
-   * @throws {Error} If initialization fails
    */
   async start() {
     try {
@@ -75,44 +71,43 @@ class TickerWatcher {
       await this.redisService.connect();
       this.logger('info', 'TickerWatcher: Redis connected');
 
-      // Step 2: Create ExchangeFactory
-      this.logger('info', 'TickerWatcher: Creating exchange factory', {
-        exchange: this.config.exchange,
-        marketType: this.config.type,
-      });
-      this.exchangeFactory = new ExchangeFactory({
-        exchange: this.config.exchange,
-        marketType: this.config.type,
-        logger: this.logger,
-      });
-
-      // Step 3: Create ConnectionManager
+      // Step 2: Create ConnectionManager
       this.logger('info', 'TickerWatcher: Creating connection manager');
       this.connectionManager = new ConnectionManager({
-        exchangeFactory: this.exchangeFactory,
-        redisService: this.redisService,
+        exchange: this.config.exchange,
+        marketType: this.config.type,
         batchSize: this.config.batchSize || 100,
+        subscriptionDelay: this.config.subscriptionDelay || 100,
+        redisBatching: this.config.redisBatching,
+        redisFlushMs: this.config.redisFlushMs,
+        redisMaxBatch: this.config.redisMaxBatch,
+        redisOnlyOnChange: this.config.redisOnlyOnChange,
+        redisMinIntervalMs: this.config.redisMinIntervalMs,
+        localIps: this.config.localIps,
+        noProxy: this.config.noProxy,
+        redisService: this.redisService,
         logger: this.logger,
       });
 
-      // Step 4: Initialize ConnectionManager (load markets, create batches)
+      // Step 3: Initialize (loads markets, creates exchange)
       this.logger('info', 'TickerWatcher: Initializing connection manager');
       await this.connectionManager.initialize();
+
+      // Store initial symbol set
+      this.currentSymbols = this.connectionManager.getActiveSymbols();
+
       this.logger('info', 'TickerWatcher: Markets loaded', {
-        symbolCount: this.connectionManager.symbols.length,
-        batchCount: this.connectionManager.batches.length,
+        symbolCount: this.currentSymbols.size,
+        batchCount: this.connectionManager.getBatchCount(),
       });
 
-      // Store initial symbol set for market discovery
-      this.currentSymbols = new Set(this.connectionManager.symbols);
-
-      // Step 5: Start subscriptions
+      // Step 4: Start subscriptions
       this.logger('info', 'TickerWatcher: Starting subscriptions');
       await this.connectionManager.startSubscriptions();
       this.logger('info', 'TickerWatcher: Subscriptions started');
 
-      // Step 6: Start market discovery loop
-      const refreshInterval = this.config.marketRefreshInterval || 300000; // 5 min default
+      // Step 5: Start market discovery loop
+      const refreshInterval = this.config.marketRefreshInterval || 300000;
       if (refreshInterval > 0) {
         this.logger('info', 'TickerWatcher: Starting market discovery loop', {
           intervalMs: refreshInterval,
@@ -123,7 +118,7 @@ class TickerWatcher {
         );
       }
 
-      // Step 7: Install signal handlers for graceful shutdown
+      // Step 6: Install signal handlers
       this.logger('info', 'TickerWatcher: Installing signal handlers');
       process.on('SIGINT', () => this._onSignal('SIGINT'));
       process.on('SIGTERM', () => this._onSignal('SIGTERM'));
@@ -133,37 +128,22 @@ class TickerWatcher {
         exchange: this.config.exchange,
         marketType: this.config.type,
         symbols: this.currentSymbols.size,
-        batches: this.connectionManager.batches.length,
+        batches: this.connectionManager.getBatchCount(),
       });
     } catch (error) {
       this.logger('error', `TickerWatcher: Startup failed: ${error.message}`, {
         error: error.stack,
       });
-      // Clean up on startup failure
-      if (this.connectionManager) {
-        try {
-          await this.connectionManager.stop();
-        } catch (e) {
-          // Ignore cleanup errors during failure
-        }
-      }
-      if (this.redisService) {
-        try {
-          await this.redisService.disconnect();
-        } catch (e) {
-          // Ignore cleanup errors during failure
-        }
-      }
+      await this._cleanup();
       throw error;
     }
   }
 
   /**
-   * Stop the orchestrator (called on signal or explicit stop)
-   * @returns {Promise<void>}
+   * Stop the orchestrator
    */
   async stop() {
-    if (this.isStopping) return; // Prevent double-stop
+    if (this.isStopping) return;
 
     this.isStopping = true;
     this.isRunning = false;
@@ -171,21 +151,21 @@ class TickerWatcher {
     this.logger('info', 'TickerWatcher: ⏹️  Shutting down gracefully...');
 
     try {
-      // Step 1: Stop market discovery loop
+      // Stop market discovery
       if (this.marketRefreshTimer) {
         clearInterval(this.marketRefreshTimer);
         this.marketRefreshTimer = null;
         this.logger('debug', 'TickerWatcher: Market discovery loop stopped');
       }
 
-      // Step 2: Stop ConnectionManager (flush Redis, close exchange)
+      // Stop connection manager
       if (this.connectionManager) {
         this.logger('debug', 'TickerWatcher: Stopping connection manager');
         await this.connectionManager.stop();
         this.logger('debug', 'TickerWatcher: Connection manager stopped');
       }
 
-      // Step 3: Disconnect Redis
+      // Disconnect Redis
       if (this.redisService) {
         this.logger('debug', 'TickerWatcher: Disconnecting from Redis');
         await this.redisService.disconnect();
@@ -203,6 +183,7 @@ class TickerWatcher {
 
   /**
    * Signal handler
+   *
    * @private
    */
   async _onSignal(signal) {
@@ -217,7 +198,8 @@ class TickerWatcher {
   }
 
   /**
-   * Market discovery loop - refresh markets, detect changes, allocate symbols
+   * Market discovery loop - refresh, diff, reallocate
+   *
    * @private
    */
   async _refreshMarkets() {
@@ -226,15 +208,17 @@ class TickerWatcher {
 
       this.logger('debug', 'TickerWatcher: Refreshing markets...');
 
-      // Load fresh market list
-      const freshMarkets = await this.exchangeFactory.loadMarkets();
-      const newSymbols = new Set(freshMarkets.map(m => m.symbol));
+      // Call public API to refresh markets
+      const { added, removed } = await this.connectionManager.refreshMarkets();
 
-      // Detect changes
-      const added = [...newSymbols].filter(s => !this.currentSymbols.has(s));
-      const removed = [...this.currentSymbols].filter(s => !newSymbols.has(s));
+      // Update tracking
+      for (const symbol of added) {
+        this.currentSymbols.add(symbol);
+      }
+      for (const symbol of removed) {
+        this.currentSymbols.delete(symbol);
+      }
 
-      // No changes
       if (added.length === 0 && removed.length === 0) {
         this.logger('debug', 'TickerWatcher: No market changes detected', {
           totalSymbols: this.currentSymbols.size,
@@ -242,197 +226,42 @@ class TickerWatcher {
         return;
       }
 
-      // Handle removed symbols
-      if (removed.length > 0) {
-        this.logger('info', 'TickerWatcher: Removing symbols', {
-          count: removed.length,
-          symbols: removed.slice(0, 5), // Log first 5
-        });
-        this._handleRemovedSymbols(removed);
-      }
-
-      // Handle new symbols
-      if (added.length > 0) {
-        this.logger('info', 'TickerWatcher: Adding new symbols', {
-          count: added.length,
-          symbols: added.slice(0, 5), // Log first 5
-        });
-        this._handleNewSymbols(added);
-      }
-
-      // Update current state
-      this.currentSymbols = newSymbols;
-
       this.logger('info', 'TickerWatcher: Market refresh complete', {
         newCount: added.length,
         removedCount: removed.length,
         totalSymbols: this.currentSymbols.size,
-        batchCount: this.connectionManager.batches.length,
+        batchCount: this.connectionManager.getBatchCount(),
       });
     } catch (error) {
       this.logger('warn', `TickerWatcher: Market refresh error: ${error.message}`, {
         error: error.stack,
       });
-      // Continue - don't crash on market discovery error
     }
   }
 
   /**
-   * Handle newly added symbols
+   * Cleanup helper
+   *
    * @private
    */
-  _handleNewSymbols(added) {
+  async _cleanup() {
     try {
-      // Try to fit into existing batches
-      for (const symbol of added) {
-        let allocated = false;
-
-        // Find batch with space
-        for (let i = 0; i < this.connectionManager.batches.length; i++) {
-          const batch = this.connectionManager.batches[i];
-          if (batch.length < this.config.batchSize) {
-            batch.push(symbol);
-            this.currentSymbols.add(symbol);
-            this.logger('debug', 'TickerWatcher: Symbol allocated to existing batch', {
-              symbol,
-              batchIndex: i,
-              batchSize: batch.length,
-            });
-            allocated = true;
-            break;
-          }
-        }
-
-        // If no space, need to recalculate batches
-        if (!allocated) {
-          // Add to symbols array and recalculate batches
-          if (!this.connectionManager.symbols.includes(symbol)) {
-            this.connectionManager.symbols.push(symbol);
-          }
-          this.currentSymbols.add(symbol);
-          this.logger('debug', 'TickerWatcher: Symbol queued for batch recalculation', {
-            symbol,
-          });
-        }
+      if (this.connectionManager) {
+        await this.connectionManager.stop().catch(() => {});
       }
-
-      // Recalculate batches to distribute any new symbols into new batches
-      const oldBatchCount = this.connectionManager.batches.length;
-      this.connectionManager._createBatches();
-      const newBatchCount = this.connectionManager.batches.length;
-
-      if (newBatchCount > oldBatchCount) {
-        this.logger('info', 'TickerWatcher: New batches created', {
-          oldCount: oldBatchCount,
-          newCount: newBatchCount,
-          newBatchesCount: newBatchCount - oldBatchCount,
-        });
-
-        // Start subscription for new batches
-        for (let i = oldBatchCount; i < newBatchCount; i++) {
-          const batch = this.connectionManager.batches[i];
-          const batchId = `batch-${i}`;
-          this.logger('debug', 'TickerWatcher: Starting subscription for new batch', {
-            batchId,
-            symbolCount: batch.length,
-          });
-          // Stagger the start to avoid thundering herd
-          const delay = i * 100;
-          setTimeout(() => {
-            if (this.isRunning && !this.isStopping) {
-              this.connectionManager
-                ._subscriptionLoop(batchId, batch)
-                .catch(error => {
-                  this.logger('error', `TickerWatcher: Subscription loop error [${batchId}]`, {
-                    error: error.message,
-                  });
-                });
-            }
-          }, delay);
-        }
+      if (this.redisService) {
+        await this.redisService.disconnect().catch(() => {});
       }
     } catch (error) {
-      this.logger('error', `TickerWatcher: Error handling new symbols: ${error.message}`, {
-        error: error.stack,
-      });
+      // Ignore cleanup errors
     }
   }
 
   /**
-   * Handle removed symbols
-   * @private
-   */
-  _handleRemovedSymbols(removed) {
-    try {
-      for (const symbol of removed) {
-        // Find and remove from batches
-        for (let i = 0; i < this.connectionManager.batches.length; i++) {
-          const batch = this.connectionManager.batches[i];
-          const index = batch.indexOf(symbol);
-          if (index !== -1) {
-            batch.splice(index, 1);
-            this.logger('debug', 'TickerWatcher: Symbol removed from batch', {
-              symbol,
-              batchIndex: i,
-            });
-            break;
-          }
-        }
-
-        // Mark as non-retryable to prevent reconnect attempts
-        this.connectionManager.nonRetryableSymbols.add(symbol);
-        this.currentSymbols.delete(symbol);
-      }
-
-      // Remove empty batches
-      const beforeCount = this.connectionManager.batches.length;
-      this.connectionManager.batches = this.connectionManager.batches.filter(
-        batch => batch.length > 0
-      );
-      const afterCount = this.connectionManager.batches.length;
-
-      if (afterCount < beforeCount) {
-        this.logger('info', 'TickerWatcher: Empty batches cleaned up', {
-          removedBatches: beforeCount - afterCount,
-          remainingBatches: afterCount,
-        });
-      }
-    } catch (error) {
-      this.logger('error', `TickerWatcher: Error handling removed symbols: ${error.message}`, {
-        error: error.stack,
-      });
-    }
-  }
-
-  /**
-   * Get orchestrator status snapshot
-   * @returns {Object}
+   * Get status
    */
   getStatus() {
-    const connectionStatus = this.connectionManager?.getStatus() || {};
-    const nextRefreshMs = this.marketRefreshTimer
-      ? Math.ceil(
-          (this.connectionManager?.config?.marketRefreshInterval || 300000) / 1000
-        ) * 1000
-      : null;
-
-    return {
-      isRunning: this.isRunning && !this.isStopping,
-      exchange: this.config.exchange,
-      marketType: this.config.type,
-      currentSymbols: this.currentSymbols.size,
-      nextMarketRefreshInSec: nextRefreshMs ? Math.ceil(nextRefreshMs / 1000) : null,
-      redisConnected: this.redisService?.isConnected || false,
-      ...connectionStatus,
-    };
-  }
-
-  /**
-   * Helper: sleep
-   * @private
-   */
-  _sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return this.connectionManager?.getStatus() || {};
   }
 }
 

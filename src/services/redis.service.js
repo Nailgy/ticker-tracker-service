@@ -396,6 +396,44 @@ class RedisService {
   }
 
   /**
+   * Check if Redis is ready for writes
+   * @returns {boolean}
+   */
+  isReady() {
+    return this.isConnected && !this.isConnecting;
+  }
+
+  /**
+   * Create a pipeline for batched operations
+   * @returns {Object} Pipeline object with hset, publish, exec methods
+   * @throws {Error} If not connected
+   */
+  createPipeline() {
+    if (!this.isConnected) {
+      throw new Error('Redis not connected - cannot create pipeline');
+    }
+    return this.redis.pipeline();
+  }
+
+  /**
+   * Execute a pipeline atomically
+   * @param {Object} pipeline - Pipeline object from createPipeline()
+   * @returns {Promise<Array>} Results of all commands
+   * @throws {Error} If execution fails
+   */
+  async execPipeline(pipeline) {
+    if (!pipeline) {
+      throw new Error('Pipeline is required');
+    }
+    try {
+      return await pipeline.exec();
+    } catch (error) {
+      this.stats.failedWrites++;
+      throw error;
+    }
+  }
+
+  /**
    * Get service status/metrics
    * @returns {Object} Status snapshot
    */
