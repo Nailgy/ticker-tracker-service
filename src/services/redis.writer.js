@@ -34,8 +34,8 @@ class RedisWriter {
     // Dedup cache
     this.dedupCache = new Map(); // Map<symbol, {hash, lastWriteTime}>
 
-    // Batching state
-    this.batch = [];
+    // Batching state (State-Collapsing Queue: only latest value per symbol!)
+    this.batch = new Map(); // Map<symbol, update>
     this.batchTimer = null;
 
     // Metrics
@@ -109,11 +109,11 @@ class RedisWriter {
 
     // Queue or write immediately
     if (this.config.redisBatching) {
-      this.batch.push(update);
-      this.metrics.queuedUpdates = this.batch.length;
+      this.batch.set(symbol, update);
+      this.metrics.queuedUpdates = this.batch.size;
 
       // Force flush if batch is full
-      if (this.batch.length >= this.config.redisMaxBatch) {
+      if (this.batch.size >= this.config.redisMaxBatch) {
         return await this.flush();
       }
 
@@ -163,19 +163,20 @@ class RedisWriter {
       this.batchTimer = null;
     }
 
-    if (this.batch.length === 0) {
+    if (this.batch.size === 0) {
       return { flushed: true, count: 0 };
     }
 
     try {
       this.config.logger('debug', `RedisWriter: Flushing batch`, {
-        count: this.batch.length,
+        count: this.batch.size,
       });
 
       const pipeline = this.redisService.createPipeline();
 
+      const updates = Array.from(this.batch.values());
       // Add all writes to pipeline
-      for (const update of this.batch) {
+      for (const update of updates) {
         pipeline.hset(update.key, update.field, update.value);
         pipeline.publish(update.pubsubChannel, update.value);
       }
@@ -188,8 +189,8 @@ class RedisWriter {
         this.metrics.queuedUpdates = 0;
         this.metrics.lastFlushAt = Date.now();
 
-        const flushCount = this.batch.length;
-        this.batch = [];
+        const flushCount = this.batch.size;
+        this.batch.clear();
 
         this.config.logger('info', `RedisWriter: Batch flushed`, {
           updates: flushCount,
@@ -204,7 +205,7 @@ class RedisWriter {
       this.metrics.failedWrites++;
       this.config.logger('error', `RedisWriter: Flush failed`, {
         error: error.message,
-        batchSize: this.batch.length,
+        batchSize: this.batch.size,
       });
       return { flushed: false, reason: 'flush-error', error: error.message };
     }
@@ -216,7 +217,7 @@ class RedisWriter {
   async disconnect() {
     try {
       // Flush any pending updates
-      if (this.batch.length > 0) {
+      if (this.batch.size > 0) {
         await this.flush();
       }
 

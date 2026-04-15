@@ -297,10 +297,16 @@ class ConnectionManager {
       }
 
       // Rewire live subscriptions to new batch topology.
-      if ((added.length > 0 || removed.length > 0) && this.isRunning) {
-        await this.#subscriptionEngine.stopSubscriptions();
+      // Note: We detect changes even if !isRunning, so if exchange recovers after
+      // complete blackout (all markets removed), subscriptions auto-restart when markets return
+      if (added.length > 0 || removed.length > 0) {
+        if (this.isRunning) {
+          await this.#subscriptionEngine.stopSubscriptions();
+        }
+
         if (this.#batches.length > 0) {
           await this.#subscriptionEngine.startSubscriptions(this.#batches);
+          this.isRunning = true;
         } else {
           this.isRunning = false;
         }

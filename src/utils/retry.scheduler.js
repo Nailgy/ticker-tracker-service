@@ -34,8 +34,11 @@ class RetryScheduler {
     // Formula: baseDelay * (2 ^ (attempt - 1))
     const exponentialDelay = this.config.baseDelayMs * Math.pow(2, attempt - 1);
 
+    const jitterMultiplier = 0.8 + (Math.random() * 0.4);
+
+    let finalDelay = exponentialDelay * jitterMultiplier;
     // Cap at max delay
-    return Math.min(exponentialDelay, this.config.maxDelayMs);
+    return Math.floor(Math.min(finalDelay, this.config.maxDelayMs));
   }
 }
 

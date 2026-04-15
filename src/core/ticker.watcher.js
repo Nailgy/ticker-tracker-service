@@ -187,12 +187,25 @@ class TickerWatcher {
    * @private
    */
   async _onSignal(signal) {
-    this.logger('info', `TickerWatcher: Received ${signal}`);
+    this.logger('info', `TickerWatcher: Received ${signal}. Graceful shutdown starting...`);
+
+    // Safety timeout: Force exit if graceful shutdown takes too long
+    // This prevents the process from becoming a zombie if Redis or network hangs
+    const forceExitTimer = setTimeout(() => {
+      this.logger('error', 'TickerWatcher: Graceful shutdown timeout (5s exceeded). Force exit.');
+      process.exit(1);
+    }, 5000);
+
     try {
       await this.stop();
+      clearTimeout(forceExitTimer);
+      this.logger('info', 'TickerWatcher: Graceful shutdown completed successfully');
       process.exit(0);
     } catch (error) {
-      this.logger('error', 'TickerWatcher: Error during signal shutdown');
+      this.logger('error', 'TickerWatcher: Error during signal shutdown', {
+        error: error.message,
+      });
+      clearTimeout(forceExitTimer);
       process.exit(1);
     }
   }
