@@ -5,6 +5,47 @@
  * Detailed resilience testing happens in Phase 1C with SubscriptionEngine unit tests.
  */
 
+jest.mock('../../src/adapters/ccxt.adapter', () => {
+  return class MockExchangeAdapter {
+    constructor(config = {}) {
+      this.config = config;
+    }
+
+    async initialize() {
+      if (this.config.exchange === 'invalid-exchange') {
+        throw new Error('Exchange not found');
+      }
+    }
+
+    async loadMarkets() {
+      return [
+        { symbol: 'BTC/USDT', active: true, spot: true },
+        { symbol: 'ETH/USDT', active: true, spot: true },
+      ];
+    }
+
+    async *subscribe(symbols) {
+      for (const symbol of symbols) {
+        yield { symbol, ticker: { symbol, last: 100 } };
+      }
+    }
+
+    async close() {}
+
+    getExchangeId() {
+      return this.config.exchange || 'binance';
+    }
+
+    getMarketType() {
+      return this.config.marketType || 'spot';
+    }
+
+    getMetrics() {
+      return { subscriptionStatus: 'ready' };
+    }
+  };
+});
+
 const ConnectionManager = require('../../src/core/connection.manager');
 
 // Mock RedisService

@@ -63,6 +63,7 @@ class ConnectionManager {
       marketType: config.marketType || 'spot',
       batchSize: config.batchSize || 100,
       subscriptionDelay: config.subscriptionDelay || 100,
+      strategyMode: config.strategyMode, // Optional explicit strategy override (Level 1 precedence)
       logger: config.logger || this._defaultLogger,
       redisBatching: config.redisBatching,
       redisFlushMs: config.redisFlushMs,
@@ -82,6 +83,7 @@ class ConnectionManager {
       // Factories for dependency injection
       adapterFactory: config.adapterFactory || defaultAdapterFactory,
       proxyProviderFactory: config.proxyProviderFactory || defaultProxyProviderFactory,
+      subscriptionEngineFactory: config.subscriptionEngineFactory, // Optional: for testing
       localIps: config.localIps || [],
       noProxy: config.noProxy || false,
     };
@@ -131,6 +133,7 @@ class ConnectionManager {
       this.#adapter = this.config.adapterFactory({
         exchange: this.config.exchange,
         marketType: this.config.marketType,
+        strategyMode: this.config.strategyMode, // Pass explicit override (Level 1 precedence)
         logger: this.config.logger,
         proxyProvider: proxyProvider,
       });
@@ -148,22 +151,37 @@ class ConnectionManager {
         logger: this.config.logger,
       });
 
-      this.#subscriptionEngine = new SubscriptionEngine(
-        this.#adapter,
-        this.#marketRegistry,
-        this.#redisWriter,
-        {
-          batchSize: this.config.batchSize,
-          subscriptionDelay: this.config.subscriptionDelay,
-          retryBaseDelayMs: this.config.retryBaseDelayMs,
-          retryMaxDelayMs: this.config.retryMaxDelayMs,
-          healthCheckIntervalMs: this.config.healthCheckIntervalMs,
-          healthCheckTimeoutMs: this.config.healthCheckTimeoutMs,
+      // Create adapter factory (for per-batch adapter creation via AdapterPool)
+      // Each batch will get its OWN adapter instance via this factory
+      const adapterFactory = async () => {
+        return this.config.adapterFactory({
+          exchange: this.config.exchange,
+          marketType: this.config.marketType,
+          strategyMode: this.config.strategyMode,
           logger: this.config.logger,
-        }
-      );
+          proxyProvider: proxyProvider,
+        });
+      };
 
-      // Initialize adapter
+      this.#subscriptionEngine = this.config.subscriptionEngineFactory
+        ? this.config.subscriptionEngineFactory()
+        : new SubscriptionEngine(
+          adapterFactory,  // Pass factory (not single adapter) for per-batch isolation
+          this.#marketRegistry,
+          this.#redisWriter,
+          {
+            batchSize: this.config.batchSize,
+            subscriptionDelay: this.config.subscriptionDelay,
+            retryBaseDelayMs: this.config.retryBaseDelayMs,
+            retryMaxDelayMs: this.config.retryMaxDelayMs,
+            healthCheckIntervalMs: this.config.healthCheckIntervalMs,
+            healthCheckTimeoutMs: this.config.healthCheckTimeoutMs,
+            logger: this.config.logger,
+          }
+        );
+
+      // Initialize one adapter for market loading (metadata gathering)
+      this.#adapter = await adapterFactory();
       await this.#adapter.initialize();
 
       // Load markets
@@ -296,18 +314,31 @@ class ConnectionManager {
         });
       }
 
-      // Rewire live subscriptions to new batch topology.
-      // Note: We detect changes even if !isRunning, so if exchange recovers after
-      // complete blackout (all markets removed), subscriptions auto-restart when markets return
+      // Rewire live subscriptions to new batch topology
+      // CRITICAL (Stage 2E): Only reallocate if subscriptions are currently running.
+      // If manager.stop() was called, refreshMarkets must NOT restart subscriptions.
+      // Respect the lifecycle state - don't change isRunning unless manager explicitly told to.
       if (added.length > 0 || removed.length > 0) {
+        if (!this.isRunning) {
+          // Market changes detected but subscriptions are not running.
+          // Don't restart them - respect the stopped state.
+          this.config.logger('debug', `ConnectionManager: Market changes detected but subscriptions not running, skipping reallocation`, {
+            added: added.length,
+            removed: removed.length,
+          });
+          return { added, removed };
+        }
+
+        // Only reallocate if manager is currently running
         if (this.isRunning) {
           await this.#subscriptionEngine.stopSubscriptions();
         }
 
         if (this.#batches.length > 0) {
           await this.#subscriptionEngine.startSubscriptions(this.#batches);
-          this.isRunning = true;
+          // Note: isRunning stays true (was already true, still true after restart)
         } else {
+          // All symbols removed - stop subscriptions
           this.isRunning = false;
         }
       }

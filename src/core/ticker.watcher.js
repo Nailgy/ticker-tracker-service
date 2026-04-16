@@ -78,6 +78,7 @@ class TickerWatcher {
         marketType: this.config.type,
         batchSize: this.config.batchSize || 100,
         subscriptionDelay: this.config.subscriptionDelay || 100,
+        strategyMode: this.config.strategyMode, // Optional explicit strategy override
         redisBatching: this.config.redisBatching,
         redisFlushMs: this.config.redisFlushMs,
         redisMaxBatch: this.config.redisMaxBatch,

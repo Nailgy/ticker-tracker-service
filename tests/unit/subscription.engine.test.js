@@ -2,10 +2,15 @@
  * SubscriptionEngine Unit Tests
  *
  * Tests subscription loop coordination, resilience, health checks, and error handling
+ * Updated for Stage 2D: Uses AdapterPool for per-batch health tracking
  */
 
 const SubscriptionEngine = require('../../src/core/subscription.engine');
 const RetryScheduler = require('../../src/utils/retry.scheduler');
+const AdapterPool = require('../../src/core/adapter.pool');
+
+// Mock AdapterPool to work with tests (Stage 2D)
+jest.mock('../../src/core/adapter.pool');
 
 describe('SubscriptionEngine', () => {
   let engine;
@@ -13,6 +18,7 @@ describe('SubscriptionEngine', () => {
   let mockRegistry;
   let mockWriter;
   let mockLogger;
+  let mockAdapterPool;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -36,6 +42,17 @@ describe('SubscriptionEngine', () => {
     mockWriter = {
       writeTicker: jest.fn().mockResolvedValue({ written: true }),
     };
+
+    // Mock AdapterPool (Stage 2D)
+    mockAdapterPool = {
+      initialize: jest.fn().mockResolvedValue(undefined),
+      recordDataForBatch: jest.fn(),
+      recordErrorForBatch: jest.fn(),
+      resetBatchForRecovery: jest.fn(),
+      getAllBatchHealth: jest.fn().mockReturnValue([]),
+      close: jest.fn().mockResolvedValue(undefined),
+    };
+    AdapterPool.mockImplementation(() => mockAdapterPool);
 
     engine = new SubscriptionEngine(mockAdapter, mockRegistry, mockWriter, {
       logger: mockLogger,
@@ -123,7 +140,7 @@ describe('SubscriptionEngine', () => {
 
     test('should set isRunning to true', async () => {
       const batchesMock = jest.fn();
-      engine.startSubscriptions([['BTC/USDT']]).catch(() => {});
+      await engine.startSubscriptions([['BTC/USDT']]);
 
       expect(engine.isRunning).toBe(true);
       expect(engine.metrics.isRunning).toBe(true);
@@ -138,7 +155,7 @@ describe('SubscriptionEngine', () => {
     });
 
     test('should initialize subscription loops', async () => {
-      engine.startSubscriptions([['BTC/USDT', 'ETH/USDT'], ['BNB/USDT']]).catch(() => {});
+      await engine.startSubscriptions([['BTC/USDT', 'ETH/USDT'], ['BNB/USDT']]);
 
       expect(engine.subscriptionLoops.size).toBe(2);
       expect(engine.subscriptionLoops.has('batch-0')).toBe(true);
@@ -146,7 +163,7 @@ describe('SubscriptionEngine', () => {
     });
 
     test('should set activeConnections in metrics', async () => {
-      engine.startSubscriptions([['BTC/USDT'], ['ETH/USDT'], ['BNB/USDT']]).catch(() => {});
+      await engine.startSubscriptions([['BTC/USDT'], ['ETH/USDT'], ['BNB/USDT']]);
 
       expect(engine.metrics.activeConnections).toBe(3);
     });
@@ -187,11 +204,11 @@ describe('SubscriptionEngine', () => {
     test('should close adapter', async () => {
       await engine.stopSubscriptions();
 
-      expect(mockAdapter.close).toHaveBeenCalled();
+      expect(engine.adapterPool.close).toHaveBeenCalled();
     });
 
     test('should handle adapter close errors', async () => {
-      mockAdapter.close.mockRejectedValue(new Error('Close failed'));
+      engine.adapterPool.close.mockRejectedValue(new Error('Close failed'));
 
       await expect(engine.stopSubscriptions()).resolves.not.toThrow();
       expect(mockLogger).toHaveBeenCalledWith('warn', expect.stringContaining('Error closing adapter'), expect.any(Object));
@@ -299,32 +316,55 @@ describe('SubscriptionEngine', () => {
   describe('Health Check', () => {
     test('should detect stale connections', () => {
       engine.isRunning = true;
+
+      // Mock AdapterPool health data (Stage 2D: per-batch health)
+      mockAdapterPool.getAllBatchHealth.mockReturnValue([
+        {
+          id: 'batch-0',
+          state: 'idle',
+          isStale: true,
+          timeSinceLastDataMs: 120000,
+          errorCount: 0,
+          retryAttempts: 0,
+          lastError: null,
+        },
+      ]);
+
       engine.subscriptionLoops.set('batch-0', {
         symbols: ['BTC/USDT'],
-        lastDataAt: Date.now() - 120000, // 2 minutes ago
-        stale: false,
+        retryAttempts: 0,
       });
-
-      const callback = jest.fn();
-      engine.onHealthCheck(callback);
 
       engine._startHealthCheck();
       jest.advanceTimersByTime(engine.config.healthCheckIntervalMs);
 
-      expect(engine.subscriptionLoops.get('batch-0').stale).toBe(true);
+      expect(mockAdapterPool.resetBatchForRecovery).toHaveBeenCalledWith('batch-0');
       expect(engine.metrics.staleDetections).toBe(1);
     });
 
     test('should call health check callbacks on stale detection', () => {
       engine.isRunning = true;
-      engine.subscriptionLoops.set('batch-0', {
-        symbols: ['BTC/USDT'],
-        lastDataAt: Date.now() - 120000,
-        stale: false,
-      });
+
+      // Mock AdapterPool health data
+      mockAdapterPool.getAllBatchHealth.mockReturnValue([
+        {
+          id: 'batch-0',
+          state: 'idle',
+          isStale: true,
+          timeSinceLastDataMs: 120000,
+          errorCount: 0,
+          retryAttempts: 0,
+          lastError: null,
+        },
+      ]);
 
       const callback = jest.fn();
       engine.onHealthCheck(callback);
+
+      engine.subscriptionLoops.set('batch-0', {
+        symbols: ['BTC/USDT'],
+        retryAttempts: 0,
+      });
 
       engine._startHealthCheck();
       jest.advanceTimersByTime(engine.config.healthCheckIntervalMs);
@@ -334,28 +374,41 @@ describe('SubscriptionEngine', () => {
 
     test('should recover from stale state when data flows', () => {
       engine.isRunning = true;
+
+      // Mock AdapterPool health data showing recovered state
+      mockAdapterPool.getAllBatchHealth.mockReturnValue([
+        {
+          id: 'batch-0',
+          state: 'recovering',
+          isStale: false,
+          timeSinceLastDataMs: 5000,
+          errorCount: 0,
+          retryAttempts: 0,
+          lastError: null,
+        },
+      ]);
+
       engine.subscriptionLoops.set('batch-0', {
         symbols: ['BTC/USDT'],
-        lastDataAt: Date.now(),
-        stale: true,
+        retryAttempts: 0,
       });
 
       engine._startHealthCheck();
       jest.advanceTimersByTime(engine.config.healthCheckIntervalMs);
 
-      expect(engine.subscriptionLoops.get('batch-0').stale).toBe(false);
+      // Verify stale is not detected again (no recovery callback)
+      expect(mockAdapterPool.resetBatchForRecovery).not.toHaveBeenCalled();
     });
   });
 
   describe('Logging', () => {
     test('should log subscription start', async () => {
-      engine.startSubscriptions([['BTC/USDT']]).catch(() => {});
+      await engine.startSubscriptions([['BTC/USDT']]);
 
-      expect(mockLogger).toHaveBeenCalledWith(
-        'info',
-        expect.stringContaining('Starting'),
-        expect.any(Object)
-      );
+      // Find the "Starting subscriptions" log message (may not be first due to AdapterPool initialization log)
+      const startingCall = mockLogger.mock.calls.find(call => call[1].includes('Starting'));
+      expect(startingCall).toBeDefined();
+      expect(startingCall[0]).toBe('info');
     });
 
     test('should log subscription stop', async () => {

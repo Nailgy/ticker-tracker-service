@@ -4,11 +4,17 @@
  * Wraps CCXT Pro exchange instances and applies watch strategy pattern.
  * This is the ONLY place where CCXT Pro is directly used.
  *
+ * Strategy Selection:
+ * - Uses StrategySelector with 3-level precedence:
+ *   1. Explicit override (config.strategyMode)
+ *   2. Exchange default (from constants/exchanges.js)
+ *   3. Capability fallback
+ *
  * Usage:
  *   const adapter = new CCXTAdapter({
  *     exchange: 'binance',
  *     marketType: 'spot',
- *     strategy: 'allTickers',
+ *     strategyMode: 'allTickers',  // Optional explicit override
  *     logger: (level, msg, data) => console.log(msg),
  *     proxyProvider: proxyProvider // optional
  *   });
@@ -17,8 +23,8 @@
  */
 
 const ExchangeAdapter = require('./exchange.adapter');
-const AllTickersStrategy = require('./strategies/all-tickers.strategy');
-const PerSymbolStrategy = require('./strategies/per-symbol.strategy');
+const StrategySelector = require('./strategies/strategy.selector');
+const { STRATEGY_MODES } = require('./strategies/strategy.interface');
 const https = require('https');
 
 // Lazy load CCXT to avoid issues if not installed
@@ -36,7 +42,7 @@ class CCXTAdapter extends ExchangeAdapter {
     this.config = {
       exchange: config.exchange,
       marketType: config.marketType || 'spot',
-      strategy: config.strategy || 'allTickers',
+      strategyMode: config.strategyMode, // Optional explicit override (Level 1 precedence)
       logger: config.logger || this._defaultLogger,
       proxyProvider: config.proxyProvider,
             ...config,
@@ -50,6 +56,7 @@ class CCXTAdapter extends ExchangeAdapter {
       symbolsSubscribed: 0,
       errorCount: 0,
       reconnectCount: 0,
+      selectedStrategy: null,
     };
   }
 
@@ -62,14 +69,14 @@ class CCXTAdapter extends ExchangeAdapter {
   }
 
   /**
-   * Initialize - create CCXT instance and select strategy
+   * Initialize - create CCXT instance and select strategy deterministically
    */
   async initialize() {
     try {
       this.config.logger('info', `CCXTAdapter: Initializing ${this.config.exchange}`, {
         exchange: this.config.exchange,
         marketType: this.config.marketType,
-        strategy: this.config.strategy,
+        strategyModeOverride: this.config.strategyMode || '(none)',
       });
 
       const ccxtLib = getCCXT();
@@ -112,13 +119,21 @@ class CCXTAdapter extends ExchangeAdapter {
 
       this.exchangeInstance = new ExchangeClass(exchangeOptions);
 
-      // Select strategy based on what the exchange supports
-      this._selectStrategy();
+      // CHANGED: Use StrategySelector with deterministic precedence rules
+      // (explicit override > exchange default > capability fallback)
+      this.strategy = StrategySelector.selectStrategy(
+        this.config.exchange,
+        this.exchangeInstance,
+        this.config
+      );
 
       this.metrics.subscriptionStatus = 'initialized';
+      this.metrics.selectedStrategy = this.strategy.getMode();
+
       this.config.logger('info', `CCXTAdapter: Initialized successfully`, {
         exchange: this.config.exchange,
-        selectedStrategy: this.strategy.constructor.name,
+        selectedStrategy: this.strategy.getMode(),
+        strategyPrecedence: this.config.strategyMode ? 'explicit-override' : 'exchange-default-or-fallback',
       });
     } catch (error) {
       this.metrics.subscriptionStatus = 'initialization-failed';
@@ -127,29 +142,6 @@ class CCXTAdapter extends ExchangeAdapter {
       });
       throw error;
     }
-  }
-
-  /**
-   * Select strategy based on exchange capabilities and config
-   */
-  _selectStrategy() {
-    // Try AllTickersStrategy first (faster, more efficient)
-    const allTickersStrategy = new AllTickersStrategy(this.config);
-    if (allTickersStrategy.isSupported(this.exchangeInstance)) {
-      this.strategy = allTickersStrategy;
-      this.config.logger('debug', `CCXTAdapter: Selected AllTickersStrategy`);
-      return;
-    }
-
-    // Fall back to PerSymbolStrategy
-    const perSymbolStrategy = new PerSymbolStrategy(this.config);
-    if (perSymbolStrategy.isSupported(this.exchangeInstance)) {
-      this.strategy = perSymbolStrategy;
-      this.config.logger('debug', `CCXTAdapter: Selected PerSymbolStrategy`);
-      return;
-    }
-
-    throw new Error(`No suitable strategy found for ${this.config.exchange}`);
   }
 
   /**
@@ -268,10 +260,10 @@ class CCXTAdapter extends ExchangeAdapter {
   }
 
   /**
-   * Check if watchTickers is supported
+   * Check if current strategy supports watchTickers (all-tickers mode)
    */
   isWatchTickersSupported() {
-    return this.strategy instanceof AllTickersStrategy;
+    return this.strategy && this.strategy.getMode() === STRATEGY_MODES.ALL_TICKERS;
   }
 
   /**

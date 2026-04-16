@@ -8,9 +8,19 @@
  * Cons: All symbols must be valid, limits on total symbols per request
  */
 
-class AllTickersStrategy {
+const { Strategy, STRATEGY_MODES } = require('./strategy.interface');
+
+class AllTickersStrategy extends Strategy {
   constructor(config) {
+    super();
     this.config = config; // {exchange, logger, proxyProvider}
+  }
+
+  /**
+   * Get strategy mode identifier
+   */
+  getMode() {
+    return STRATEGY_MODES.ALL_TICKERS;
   }
 
   /**
@@ -31,6 +41,7 @@ class AllTickersStrategy {
     this.config.logger('debug', `AllTickersStrategy: Subscribing to ${symbols.length} symbols via watchTickers`, {
       exchange: this.config.exchange,
       symbolCount: symbols.length,
+      mode: this.getMode(),
     });
 
     while (true) {

@@ -1,10 +1,17 @@
 /**
- * SubscriptionEngine - Subscription Loop Coordination & Resilience
+ * SubscriptionEngine - Subscription Loop Coordination & Per-Connection Resilience
+ *
+ * CRITICAL UPDATE: Uses AdapterPool with factory pattern for TRUE per-connection isolation
+ * - Each batch gets its OWN adapter instance (unique connection)
+ * - Batch connection failure ONLY affects that batch
+ * - Per-batch health tracking (via AdapterPool)
  *
  * Encapsulates ALL subscription loop logic internally:
- * - Batch subscription management
+ * - Per-batch adapter allocation (factory-based)
+ * - Per-batch subscription management
+ * - Per-batch health tracking (via AdapterPool)
  * - Exponential backoff on errors
- * - Health check / stale detection
+ * - Per-batch stale detection
  * - Non-retryable symbol handling
  * - Callback-based ticker delivery
  *
@@ -12,18 +19,19 @@
  * All state is internal and protected.
  *
  * Usage:
- *   const engine = new SubscriptionEngine(adapter, registry, writer, config);
+ *   const engine = new SubscriptionEngine(adapterFactory, registry, writer, config);
  *   engine.onTicker((symbol, ticker) => {...});
  *   engine.onError((batchId, error) => {...});
- *   await engine.startSubscriptions();
+ *   await engine.startSubscriptions(batches);
  *   await engine.stopSubscriptions();
  */
 
 const RetryScheduler = require('../utils/retry.scheduler');
+const AdapterPool = require('./adapter.pool');
 
 class SubscriptionEngine {
-  constructor(adapter, registry, writer, config = {}) {
-    this.adapter = adapter;
+  constructor(adapterFactory, registry, writer, config = {}) {
+    this.adapterFactory = adapterFactory;  // Factory to CREATE new adapters per batch
     this.registry = registry;
     this.writer = writer;
 
@@ -37,12 +45,22 @@ class SubscriptionEngine {
       subscriptionDelay: config.subscriptionDelay || 100,
     };
 
+    // Adapter pool for per-batch connection isolation (CRITICAL: Stage 2 Per-Connection)
+    // Each batch gets its OWN adapter instance via factory
+    this.adapterPool = new AdapterPool(
+      this.adapterFactory,  // Factory creates NEW adapters per batch
+      this.config
+    );
+
+    // Exchange metadata (same for all batches, set when first adapter created)
+    this.exchangeId = null;
+    this.marketType = null;
+
     // Subscription state (ALL internal)
     this.isRunning = false;
-    this.subscriptionLoops = new Map();      // Map<batchId, {symbols, lastDataAt, retryAttempts}>
+    this.subscriptionLoops = new Map();      // Map<batchId, {symbols, retryAttempts}>
     this.subscriptionTimers = [];            // Stagger startup timers
     this.healthCheckInterval = null;
-    this.healthCheckTimers = new Map();      // Per-batch health check
 
     // Resilience state
     this.retryScheduler = new RetryScheduler({
@@ -110,11 +128,14 @@ class SubscriptionEngine {
     }
 
     try {
+      // Initialize adapter pool (creates adapters on-demand per batch)
+      await this.adapterPool.initialize();
+
       this.isRunning = true;
       this.metrics.isRunning = true;
       this.metrics.activeConnections = batches.length;
 
-      this.config.logger('info', `SubscriptionEngine: Starting ${batches.length} subscription loops`, {
+      this.config.logger('info', `SubscriptionEngine: Starting ${batches.length} subscription loops (per-batch adapters)`, {
         batches: batches.length,
         batchSize: this.config.batchSize,
       });
@@ -126,9 +147,7 @@ class SubscriptionEngine {
 
         this.subscriptionLoops.set(batchId, {
           symbols,
-          lastDataAt: Date.now() + (this.config.healthCheckTimeoutMs || 60000) + 30000, // Grace period
           retryAttempts: 0,
-          stale: false,
         });
 
         // Stagger batch startup
@@ -181,17 +200,11 @@ class SubscriptionEngine {
       this.healthCheckInterval = null;
     }
 
-    // Clear per-batch health checks
-    for (const timer of this.healthCheckTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.healthCheckTimers.clear();
-
-    // Close adapter
+    // Close adapter pool (closes all per-batch adapters)
     try {
-      await this.adapter.close();
+      await this.adapterPool.close();
     } catch (error) {
-      this.config.logger('warn', `SubscriptionEngine: Error closing adapter`, {
+      this.config.logger('warn', `SubscriptionEngine: Error closing adapter pool`, {
         error: error.message,
       });
     }
@@ -201,18 +214,31 @@ class SubscriptionEngine {
   }
 
   /**
-   * Internal subscription loop for a batch
-   * This runs in background as fire-and-forget async
+   * Internal subscription loop for a batch (with per-batch adapter and health tracking)
+   * CRITICAL: Each batch uses its OWN adapter instance (per-connection isolation)
    *
    * @private
    */
   async _subscriptionLoop(batchId) {
+    let batchAdapterWrapper = null;
+
     try {
       const loopState = this.subscriptionLoops.get(batchId);
       if (!loopState) return;
 
+      // Get THIS BATCH'S adapter instance (creates new if not exists)
+      batchAdapterWrapper = await this.adapterPool.getBatchAdapter(batchId);
+      const batchAdapter = batchAdapterWrapper.adapter;
+
+      // Set exchange metadata from first adapter
+      if (!this.exchangeId && batchAdapter.getExchangeId) {
+        this.exchangeId = batchAdapter.getExchangeId();
+        this.marketType = batchAdapter.getMarketType();
+      }
+
       this.config.logger('info', `SubscriptionEngine: Subscription loop started [${batchId}]`, {
         symbols: loopState.symbols.length,
+        hasOwnAdapter: true,
       });
 
       while (this.isRunning && this.subscriptionLoops.has(batchId)) {
@@ -228,23 +254,21 @@ class SubscriptionEngine {
             continue;
           }
 
-          // Subscribe and iterate through tickers
-          for await (const { symbol, ticker } of this.adapter.subscribe(activeSymbols)) {
+          // Subscribe using THIS BATCH'S adapter (per-connection isolation)
+          for await (const { symbol, ticker } of batchAdapter.subscribe(activeSymbols)) {
             if (!this.isRunning) break;
 
-            // Update health state
-            const loopState = this.subscriptionLoops.get(batchId);
-            if (loopState) {
-              loopState.lastDataAt = Date.now();
-              loopState.stale = false;
-              loopState.retryAttempts = 0; // Reset on success
-            }
+            // Update batch-local health
+            this.adapterPool.recordDataForBatch(batchId);
+
+            // Update retry attempts (reset on success)
+            loopState.retryAttempts = 0;
 
             // Write to Redis
             try {
               await this.writer.writeTicker(
-                this.adapter.getExchangeId(),
-                this.adapter.getMarketType(),
+                this.exchangeId,
+                this.marketType,
                 symbol,
                 ticker
               );
@@ -266,6 +290,10 @@ class SubscriptionEngine {
           }
         } catch (error) {
           this.metrics.totalErrors++;
+
+          // Record error in batch-local health (isolated per batch)
+          this.adapterPool.recordErrorForBatch(batchId, error);
+
           this._callErrorCallbacks(batchId, error);
 
           // Check if non-retryable error
@@ -287,20 +315,17 @@ class SubscriptionEngine {
             await this._sleep(1000);
           } else {
             // Retryable error - apply exponential backoff
-            const loopState = this.subscriptionLoops.get(batchId);
-            if (loopState) {
-              loopState.retryAttempts++;
-              const delay = this.retryScheduler.calculateBackoff(loopState.retryAttempts);
+            loopState.retryAttempts++;
+            const delay = this.retryScheduler.calculateBackoff(loopState.retryAttempts);
 
-              this.config.logger('warn', `SubscriptionEngine: Exponential backoff [${batchId}]`, {
-                attempt: loopState.retryAttempts,
-                delayMs: delay,
-              });
+            this.config.logger('warn', `SubscriptionEngine: Exponential backoff [${batchId}]`, {
+              attempt: loopState.retryAttempts,
+              delayMs: delay,
+            });
 
-              this.metrics.retryQueue++;
-              await this._sleep(delay);
-              this.metrics.retryQueue--;
-            }
+            this.metrics.retryQueue++;
+            await this._sleep(delay);
+            this.metrics.retryQueue--;
           }
         }
       }
@@ -316,7 +341,8 @@ class SubscriptionEngine {
   }
 
   /**
-   * Global health check - detect stale connections
+   * Global health check - per-batch stale detection (via AdapterPool)
+   * Each batch has isolated health state (per-connection)
    *
    * @private
    */
@@ -324,42 +350,37 @@ class SubscriptionEngine {
     this.healthCheckInterval = setInterval(() => {
       if (!this.isRunning) return;
 
-      for (const [batchId, loopState] of this.subscriptionLoops.entries()) {
-        const timeSinceLastMessage = Date.now() - loopState.lastDataAt;
-        const threshold = this.config.healthCheckTimeoutMs || 60000;
+      // Get health for all batches from AdapterPool (per-batch isolation)
+      const allBatchHealth = this.adapterPool.getAllBatchHealth();
 
-        if (timeSinceLastMessage > threshold && !loopState.stale) {
-          loopState.stale = true;
-          this.metrics.staleDetections++;
+      for (const health of allBatchHealth) {
+        if (health.isStale) {
+          if (health.state !== 'stale') {
+            // First time detecting stale for this batch
+            this.metrics.staleDetections++;
 
-          this.config.logger('warn', `SubscriptionEngine: Stale connection detected [${batchId}]`, {
-            timeSinceLastMessageMs: timeSinceLastMessage,
-            thresholdMs: threshold,
-          });
+            this.config.logger('warn', `SubscriptionEngine: Stale connection detected [${health.id}]`, {
+              timeSinceLastMessageMs: health.timeSinceLastDataMs,
+              thresholdMs: this.config.healthCheckTimeoutMs,
+            });
 
-          // Force reconnection by closing exchange
-          try {
-            this.adapter.close().catch(() => {}); // Silently ignore close errors
-          } catch (error) {
-            // Ignore
-          }
+            // Mark batch as stale in pool (isolated recovery)
+            this.adapterPool.resetBatchForRecovery(health.id);
 
-          // Call health check callbacks
-          for (const callback of this.healthCheckCallbacks) {
-            try {
-              callback(batchId, { stale: true });
-            } catch (cbError) {
-              this.config.logger('error', `SubscriptionEngine: Health check callback error`, {
-                error: cbError.message,
-              });
+            // Note: Per-batch adapters are managed by AdapterPool
+            // Each batch's adapter handles its own reconnection
+
+            // Call health check callbacks
+            for (const callback of this.healthCheckCallbacks) {
+              try {
+                callback(health.id, { stale: true });
+              } catch (cbError) {
+                this.config.logger('error', `SubscriptionEngine: Health check callback error`, {
+                  error: cbError.message,
+                });
+              }
             }
           }
-        }
-
-        // Reset stale flag if data is flowing
-        if (timeSinceLastMessage <= threshold && loopState.stale) {
-          loopState.stale = false;
-          this.config.logger('info', `SubscriptionEngine: Connection recovered [${batchId}]`);
         }
       }
     }, this.config.healthCheckIntervalMs || 15000);
@@ -439,6 +460,8 @@ class SubscriptionEngine {
       failedBatches: this.metrics.failedBatches,
       retryQueue: this.metrics.retryQueue,
       metrics: { ...this.metrics },
+      // Add batch health from AdapterPool (Stage 2D)
+      batchHealth: this.adapterPool?.getAllBatchHealth() || [],
     };
   }
 }

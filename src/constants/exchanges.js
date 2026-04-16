@@ -2,7 +2,7 @@
  * Exchange Configuration Constants
  *
  * Defines exchange-specific configurations including:
- * - Watch mode (watchTickers vs watchTicker)
+ * - Watch mode strategy (allTickers, batchWatchTickers, perSymbol)
  * - Resilience/health check parameters tuned per exchange stability
  * - Market type support
  *
@@ -12,15 +12,17 @@
  * - Proxy scenarios: Moderate timeouts to allow IP rotation
  */
 
+const { STRATEGY_MODES } = require('../adapters/strategies/strategy.interface');
+
 const EXCHANGE_CONFIGS = {
   binance: {
     /**
      * Binance: Extremely stable, high-reliability infrastructure
-     * - watchTickers: Batch updates all requested symbols simultaneously
+     * - watchTickers strategy: Batch updates all requested symbols simultaneously
      * - Rarely needs reconnection
      * - Can tolerate longer backoff intervals
      */
-    watchMode: 'watchTickers',
+    watchMode: STRATEGY_MODES.ALL_TICKERS,
     supportedMarketTypes: ['spot', 'swap'],
     resilience: {
       retryBaseDelayMs: 1000,       // Initial: 1 second
@@ -33,10 +35,10 @@ const EXCHANGE_CONFIGS = {
   bybit: {
     /**
      * Bybit: Stable, similar to Binance
-     * - watchTickers: Batch updates
+     * - watchTickers strategy: Batch updates
      * - Similar stability to Binance
      */
-    watchMode: 'watchTickers',
+    watchMode: STRATEGY_MODES.ALL_TICKERS,
     supportedMarketTypes: ['spot', 'swap'],
     resilience: {
       retryBaseDelayMs: 1000,
@@ -49,11 +51,11 @@ const EXCHANGE_CONFIGS = {
   kraken: {
     /**
      * Kraken: Stable but per-symbol only API
-     * - watchTicker: Single symbol per call (no batch)
+     * - watchTicker strategy: Single symbol per call (no batch)
      * - Requires single connections per symbol = more overhead
      * - Slightly shorter timeouts for better responsiveness
      */
-    watchMode: 'watchTicker',
+    watchMode: STRATEGY_MODES.PER_SYMBOL,
     supportedMarketTypes: ['spot', 'swap'],
     resilience: {
       retryBaseDelayMs: 1000,
@@ -68,7 +70,7 @@ const EXCHANGE_CONFIGS = {
    * Conservative settings for unknown behavior
    */
   default: {
-    watchMode: 'watchTickers',
+    watchMode: STRATEGY_MODES.ALL_TICKERS,
     supportedMarketTypes: ['spot'],
     resilience: {
       retryBaseDelayMs: 1000,
@@ -115,6 +117,7 @@ function supportsMarketType(exchangeName, marketType) {
 
 module.exports = {
   EXCHANGE_CONFIGS,
+  STRATEGY_MODES,
   getResilienceConfig,
   getWatchMode,
   supportsMarketType,

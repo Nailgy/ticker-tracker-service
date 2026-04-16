@@ -108,7 +108,7 @@ describe('RedisWriter', () => {
       expect(result1.written).toBe(true);
       expect(result1.batched).toBe(true);
       expect(result2.batched).toBe(true);
-      expect(writer.batch.length).toBe(2);
+      expect(writer.batch.size).toBe(2);
     });
 
     it('should flush queued writes', async () => {
@@ -119,7 +119,7 @@ describe('RedisWriter', () => {
 
       expect(result.flushed).toBe(true);
       expect(result.count).toBe(2);
-      expect(writer.batch.length).toBe(0);
+      expect(writer.batch.size).toBe(0);
       expect(mockPipeline.exec).toHaveBeenCalled();
     });
 
@@ -144,7 +144,8 @@ describe('RedisWriter', () => {
       });
 
       expect(result2.written).toBe(true);
-      expect(writer.batch.length).toBe(2);
+      // State-Collapsing Queue: same symbol, multiple updates = only latest stored
+      expect(writer.batch.size).toBe(1);
     });
 
     it('should respect rate limiting per symbol', async () => {
