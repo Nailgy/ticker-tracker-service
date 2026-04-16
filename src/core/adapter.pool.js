@@ -59,6 +59,7 @@ class AdapterPool {
   /**
    * Get or create adapter for a batch (CREATES NEW adapter per batch via factory)
    * CRITICAL: Each batch gets its OWN adapter instance (per-connection isolation)
+   * REQUIRED: Initialize adapter before returning (so it's ready for subscribe())
    */
   async getBatchAdapter(batchId) {
     if (!this.adapters.has(batchId)) {
@@ -67,6 +68,13 @@ class AdapterPool {
 
         // CRITICAL: Call factory to create NEW adapter instance per batch
         const newAdapter = await this.adapterFactory();
+
+        // CRITICAL FIX: Initialize adapter BEFORE returning (required for subscribe())
+        // This ensures per-batch adapters are ready with CCXT instance and strategy
+        // Guard: Only call initialize if adapter has it (backward compatibility)
+        if (newAdapter.initialize && typeof newAdapter.initialize === 'function') {
+          await newAdapter.initialize();
+        }
 
         this.adapters.set(batchId, {
           id: batchId,
@@ -81,9 +89,9 @@ class AdapterPool {
           subscriptionPromise: null,
         });
 
-        this.logger('debug', `AdapterPool: Created unique adapter for ${batchId} (per-connection isolation)`);
+        this.logger('debug', `AdapterPool: Created and initialized unique adapter for ${batchId} (per-connection isolation)`);
       } catch (error) {
-        this.logger('error', `AdapterPool: Failed to create adapter for ${batchId}`, { error: error.message });
+        this.logger('error', `AdapterPool: Failed to create/initialize adapter for ${batchId}`, { error: error.message });
         throw error;
       }
     }

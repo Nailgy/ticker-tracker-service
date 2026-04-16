@@ -2215,3 +2215,111 @@ describe('Stage 2: Staggered Startup Timing Validation', () => {
     }
   });
 });
+
+describe('Stage 2 CRITICAL: Adapter Initialization Before Subscribe (Runtime Blocker Fix)', () => {
+  test('AdapterPool calls initialize() on per-batch adapters', async () => {
+    const AdapterPool = require('../../src/core/adapter.pool');
+    let initializeCallCount = 0;
+
+    const adapterFactory = async () => ({
+      initialize: async () => {
+        initializeCallCount++;
+      },
+      subscribe: async function* (symbols) {
+        // This should not be called in this test
+        throw new Error('subscribe should not be called in initialization test');
+      },
+      close: async () => {},
+    });
+
+    const pool = new AdapterPool(adapterFactory, { logger: () => {} });
+    await pool.initialize();
+
+    try {
+      // Get first batch adapter - should call initialize
+      const wrapper1 = await pool.getBatchAdapter('batch-0');
+      expect(initializeCallCount).toBe(1);
+
+      // Get second batch adapter - should call initialize again (new adapter)
+      const wrapper2 = await pool.getBatchAdapter('batch-1');
+      expect(initializeCallCount).toBe(2);
+
+      // Verify each adapter is unique
+      expect(wrapper1.adapter).not.toBe(wrapper2.adapter);
+    } finally {
+      await pool.close();
+    }
+  });
+
+  test('initialize() is called during adapter creation in AdapterPool', async () => {
+    const AdapterPool = require('../../src/core/adapter.pool');
+
+    let initializeCalls = [];
+
+    const adapterFactory = async () => {
+      let initialized = false;
+      return {
+        initialize: async () => {
+          if (!initialized) {
+            initializeCalls.push(Date.now());
+            initialized = true;
+          }
+        },
+        subscribe: async function* (symbols) {
+          yield { symbol: symbols[0], ticker: { last: 100 } };
+        },
+        close: async () => {},
+      };
+    };
+
+    const pool = new AdapterPool(adapterFactory, { logger: () => {} });
+    await pool.initialize();
+
+    try {
+      // Create adapters for 3 batches
+      const batch0 = await pool.getBatchAdapter('batch-0');
+      const batch1 = await pool.getBatchAdapter('batch-1');
+      const batch2 = await pool.getBatchAdapter('batch-2');
+
+      // CRITICAL VALIDATION: initialize() was called for each batch
+      expect(initializeCalls.length).toBe(3);
+
+      // Verify timestamps show sequential initialization
+      if (initializeCalls.length === 3) {
+        expect(initializeCalls[1]).toBeGreaterThanOrEqual(initializeCalls[0]);
+        expect(initializeCalls[2]).toBeGreaterThanOrEqual(initializeCalls[1]);
+      }
+    } finally {
+      await pool.close();
+    }
+  });
+
+  test('AdapterPool handles adapters without initialize() gracefully (backward compatibility)', async () => {
+    const AdapterPool = require('../../src/core/adapter.pool');
+
+    // Old adapters might not have initialize()
+    const adaptersCreated = [];
+    const adapterFactory = async () => {
+      const adapter = {
+        subscribe: async function* (symbols) {
+          yield { symbol: symbols[0], ticker: { last: 100 } };
+        },
+        close: async () => {},
+      };
+      adaptersCreated.push(adapter);
+      return adapter;
+    };
+
+    const pool = new AdapterPool(adapterFactory, { logger: () => {} });
+    await pool.initialize();
+
+    try {
+      // Should not throw even though adapter lacks initialize()
+      const wrapper = await pool.getBatchAdapter('batch-0');
+      expect(wrapper).toBeDefined();
+      expect(adaptersCreated.length).toBe(1);
+    } finally {
+      await pool.close();
+    }
+  });
+});

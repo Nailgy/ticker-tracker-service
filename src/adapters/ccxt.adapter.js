@@ -70,8 +70,15 @@ class CCXTAdapter extends ExchangeAdapter {
 
   /**
    * Initialize - create CCXT instance and select strategy deterministically
+   * IDEMPOTENT: Safe to call multiple times
    */
   async initialize() {
+    // Early return if already initialized (idempotent)
+    if (this.strategy && this.exchangeInstance) {
+      this.config.logger('debug', `CCXTAdapter: Already initialized ${this.config.exchange}`);
+      return;
+    }
+
     try {
       this.config.logger('info', `CCXTAdapter: Initializing ${this.config.exchange}`, {
         exchange: this.config.exchange,
