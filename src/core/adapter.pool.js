@@ -1,8 +1,13 @@
 /**
- * AdapterPool - Per-Batch Connection Isolation
+ * AdapterPool - Per-Batch Connection Isolation with State Machine & Escalation
  *
  * CRITICAL: This provides TRUE per-connection isolation (NOT just health isolation).
  * Each batch gets its OWN exchange instance with its OWN connection.
+ *
+ * Stage 3 Enhancements:
+ * - ConnectionStateMachine: Guarded state transitions (idle → connecting → subscribed → stale → recovering → failed)
+ * - StaleWatchdog: Escalation-based detection (HEALTHY → WARNED → RECOVERING → FAILED)
+ * - Per-batch resilience: Each batch independently recovers before global health check
  *
  * What this solves:
  * - Before: Single shared adapter → one connection failure kills ALL batches
@@ -11,7 +16,9 @@
  * Architecture:
  * - Factory pattern: adapterFactory() called ONCE PER BATCH
  * - Each batch gets unique adapter instance with own CCXT exchange and WebSocket
- * - Per-batch health tracking on metadata (state, health counters)
+ * - State machine enforces legal transitions (catches bugs early)
+ * - Stale watchdog escalates gradually (warn → recover → fail)
+ * - Per-batch health tracking and independent recovery
  * - TRUE connection isolation: Batch-1 failure DOESN'T affect Batch-2/Batch-3 connections
  *
  * Usage:
@@ -20,7 +27,11 @@
  *   const wrapper = await pool.getBatchAdapter('batch-0');  // Creates NEW adapter per batch
  *   pool.recordDataForBatch('batch-0');
  *   pool.recordErrorForBatch('batch-0', error);
+ *   const escalation = pool.checkStaleEscalation('batch-0');  // Per-batch escalation check
  */
+
+const ConnectionStateMachine = require('./state-machine');
+const StaleWatchdog = require('./stale-watchdog');
 
 class AdapterPool {
   constructor(adapterFactory, config = {}) {
@@ -79,7 +90,12 @@ class AdapterPool {
         this.adapters.set(batchId, {
           id: batchId,
           adapter: newAdapter,  // UNIQUE adapter per batch - OWN connection
-          state: 'idle', // idle | subscribing | stale | failed | recovering
+          stateMachine: new ConnectionStateMachine(batchId, { logger: this.logger }), // State machine with guarded transitions
+          staleWatchdog: new StaleWatchdog(batchId, {
+            logger: this.logger,
+            staleTimeoutMs: this.config.staleTimeoutMs || 60000
+          }), // Escalation-based stale detection
+          state: 'idle', // idle | subscribing | stale | failed | recovering (kept for compatibility)
           health: {
             lastDataAt: Date.now(),
             errorCount: 0,
@@ -127,6 +143,16 @@ class AdapterPool {
       wrapper.health.lastDataAt = Date.now();
       wrapper.health.errorCount = 0;
       wrapper.state = 'idle';
+      wrapper.staleWatchdog.recordData();  // Reset escalation level
+
+      // Attempt state machine transition to idle state
+      try {
+        if (wrapper.stateMachine.getState() !== 'idle') {
+          wrapper.stateMachine.transition('idle', 'data received, health recovered');
+        }
+      } catch (error) {
+        this.logger('debug', `AdapterPool: State transition to idle failed for ${batchId}`, { error: error.message });
+      }
     }
   }
 
@@ -141,6 +167,19 @@ class AdapterPool {
       wrapper.health.lastError = error;
       wrapper.health.retryAttempts++;
       wrapper.state = 'failed';
+
+      // Attempt state machine transition to failed state
+      try {
+        const currentState = wrapper.stateMachine.getState();
+        if (currentState !== 'failed') {
+          wrapper.stateMachine.transition('failed', `error: ${error.message}`, {
+            errorName: error.name,
+            retryAttempt: wrapper.health.retryAttempts
+          });
+        }
+      } catch (error) {
+        this.logger('debug', `AdapterPool: State transition to failed failed for ${batchId}`, { error: error.message });
+      }
 
       this.logger('warn', `AdapterPool: Error for batch [${batchId}] (attempt ${wrapper.health.retryAttempts})`, {
         error: error.message,
@@ -171,12 +210,72 @@ class AdapterPool {
   }
 
   /**
+   * Check stale watchdog escalation for a batch (STAGE 3)
+   * Returns { action, level, ms } - what recovery action to take
+   * Actions: warn (log), recover (per-batch recovery), fail (mark failed), none (healthy)
+   */
+  checkStaleEscalation(batchId) {
+    const wrapper = this.adapters.get(batchId);
+    if (!wrapper) return { action: 'none', level: 'UNKNOWN', reason: 'batch not found' };
+
+    const escalation = wrapper.staleWatchdog.checkStale();
+    return escalation;
+  }
+
+  /**
+   * Get watchdog state for a batch (STAGE 3)
+   * Returns current escalation level: HEALTHY, WARNED, RECOVERING, FAILED
+   */
+  getWatchdogState(batchId) {
+    const wrapper = this.adapters.get(batchId);
+    if (!wrapper) return null;
+    return wrapper.staleWatchdog.getLevelName();
+  }
+
+  /**
+   * Attempt guarded state transition for a batch (STAGE 3)
+   * Returns transition record if successful, throws if illegal
+   */
+  transitionBatchState(batchId, newState, reason) {
+    const wrapper = this.adapters.get(batchId);
+    if (!wrapper) throw new Error(`Batch ${batchId} not found`);
+
+    try {
+      const record = wrapper.stateMachine.transition(newState, reason);
+      wrapper.state = newState;  // Update string state for compatibility
+      return record;
+    } catch (error) {
+      this.logger('warn', `AdapterPool: Illegal state transition for ${batchId}`, {
+        error: error.message,
+        newState
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Get state machine history for a batch (STAGE 3)
+   * For auditing and troubleshooting
+   */
+  getTransitionHistory(batchId) {
+    const wrapper = this.adapters.get(batchId);
+    if (!wrapper) return [];
+    return wrapper.stateMachine.getTransitionHistory();
+  }
+
+  /**
    * Get all batch health states (for monitoring and diagnosing)
    */
   getAllBatchHealth() {
     const health = [];
     for (const batchId of this.adapters.keys()) {
-      health.push(this.getHealthForBatch(batchId));
+      const h = this.getHealthForBatch(batchId);
+      if (h) {
+        // Add STAGE 3 watchdog state
+        h.watchdogLevel = this.getWatchdogState(batchId);
+        h.stateMachineState = this.adapters.get(batchId).stateMachine.getState();
+        health.push(h);
+      }
     }
     return health;
   }
@@ -192,6 +291,16 @@ class AdapterPool {
       wrapper.health.lastDataAt = Date.now();
       wrapper.health.errorCount = 0;
       // Note: Don't reset retryAttempts - use for exponential backoff
+
+      // Attempt state machine transition to recovering state
+      try {
+        const currentState = wrapper.stateMachine.getState();
+        if (currentState !== 'recovering' && currentState !== 'idle') {
+          wrapper.stateMachine.transition('recovering', 'per-batch recovery attempt');
+        }
+      } catch (error) {
+        this.logger('debug', `AdapterPool: State transition to recovering failed for ${batchId}`, { error: error.message });
+      }
     }
   }
 

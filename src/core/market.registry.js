@@ -1,11 +1,16 @@
 /**
- * MarketRegistry - Symbol State Machine
+ * MarketRegistry - Symbol State Machine with Hard Non-Retryable Eviction (STAGE 3)
  *
  * Encapsulates all symbol lifecycle management:
  * - Desired symbols (from exchange markets)
  * - Active symbols (currently tracking)
  * - Non-retryable symbols (permanently failed/delisted)
  * - Batch allocations (which batch owns which symbols)
+ *
+ * Stage 3 Enhancement:
+ * - Hard eviction: removes from BOTH desired AND active sets
+ * - Metadata tracking: reason, firstSeen, lastSeen, batchId
+ * - Can't be re-added by market refresh (removal from desired is hard)
  *
  * No external mutations of state - all changes go through public methods.
  *
@@ -14,8 +19,10 @@
  *   await registry.loadDesiredMarkets(exchangeAdapter);
  *   registry.addSymbols(newSymbols);
  *   const {added, removed} = registry.getDiffSince(previousState);
- *   registry.markNonRetryable(failedSymbols);
+ *   registry.markNonRetryable(failedSymbols, 'delisted');  // Hard eviction + metadata
  */
+
+const NonRetryableRegistry = require('./non-retryable-registry');
 
 class MarketRegistry {
   constructor(config = {}) {
@@ -32,6 +39,9 @@ class MarketRegistry {
     // Batch allocation
     this.batchAllocations = new Map();        // Map<batchId, Set<symbol>>
     this.symbolToBatchMap = new Map();        // Map<symbol, batchId> (reverse lookup)
+
+    // Stage 3: Non-retryable metadata registry
+    this.nonRetryableMetadata = new NonRetryableRegistry({ logger: this.config.logger });
 
     // Metrics
     this.metrics = {
@@ -151,9 +161,12 @@ class MarketRegistry {
 
   /**
    * Mark symbols as non-retryable (permanent failure)
-   * Will not be re-added on market refresh
+   * Stage 3: Hard eviction from BOTH active AND desired (can't be re-added by refresh)
+   * @param {Array} symbols - Symbols to mark
+   * @param {string} reason - Reason (delisted, invalid, banned, etc.)
+   * @param {Object} metadata - Additional context ({batchId, errorMessage, etc.})
    */
-  markNonRetryable(symbols) {
+  markNonRetryable(symbols, reason = 'unknown', metadata = {}) {
     if (!Array.isArray(symbols) || symbols.length === 0) {
       return { marked: [] };
     }
@@ -162,11 +175,15 @@ class MarketRegistry {
 
     for (const symbol of symbols) {
       if (!this.nonRetryableSymbols.has(symbol)) {
-        this.nonRetryableSymbols.add(symbol);
+        // Stage 1: Remove from active
         this.activeSymbols.delete(symbol);
+
+        // Stage 2 (NEW): Remove from DESIRED - hard eviction, can't be re-added by refresh
+        this.desiredSymbols.delete(symbol);
+
         marked.push(symbol);
 
-        // Remove from batch allocations
+        // Stage 3: Remove from batch allocations
         const batchId = this.symbolToBatchMap.get(symbol);
         if (batchId) {
           const batch = this.batchAllocations.get(batchId);
@@ -175,19 +192,29 @@ class MarketRegistry {
           }
           this.symbolToBatchMap.delete(symbol);
         }
+
+        // Stage 4 (NEW): Add to non-retryable set
+        this.nonRetryableSymbols.add(symbol);
+
+        // Stage 5 (NEW): Track metadata for forensics
+        this.nonRetryableMetadata.markNonRetryable(symbol, reason, {
+          ...metadata,
+          batchId: batchId || null
+        });
       }
     }
 
     this._updateMetrics();
 
     if (marked.length > 0) {
-      this.config.logger('info', `MarketRegistry: Symbols marked non-retryable`, {
+      this.config.logger('info', `MarketRegistry: Symbols marked non-retryable (hard eviction from desired+active)`, {
         count: marked.length,
+        reason: reason,
         examples: marked.slice(0, 3),
       });
     }
 
-    return { marked };
+    return { marked, auditTrail: this.nonRetryableMetadata.getAuditTrail() };
   }
 
   /**
@@ -265,6 +292,22 @@ class MarketRegistry {
    */
   getNonRetryableSymbols() {
     return new Set(this.nonRetryableSymbols);
+  }
+
+  /**
+   * Get non-retryable metadata audit trail (Stage 3)
+   * For forensics: when, why, and where each symbol was evicted
+   */
+  getNonRetryableAuditTrail() {
+    return this.nonRetryableMetadata.getAuditTrail();
+  }
+
+  /**
+   * Get non-retryable stats (Stage 3)
+   * Break down by reason, batch, attempts
+   */
+  getNonRetryableStats() {
+    return this.nonRetryableMetadata.getStats();
   }
 
   /**

@@ -28,6 +28,8 @@
 
 const RetryScheduler = require('../utils/retry.scheduler');
 const AdapterPool = require('./adapter.pool');
+const RetryTimerRegistry = require('./retry-timer-registry');
+const HealthRatioPolicy = require('./health-ratio-policy');
 
 class SubscriptionEngine {
   constructor(adapterFactory, registry, writer, config = {}) {
@@ -67,6 +69,15 @@ class SubscriptionEngine {
       baseDelayMs: this.config.retryBaseDelayMs,
       maxDelayMs: this.config.retryMaxDelayMs,
     });
+
+    // Stage 3 Resilience Modules
+    this.timerRegistry = new RetryTimerRegistry({ logger: this.config.logger });  // Track per-batch retry timers
+    this.healthRatioPolicy = new HealthRatioPolicy({
+      minHealthyRatio: config.minHealthyRatio || 0.5,
+      ratioBreachCycles: config.ratioBreachCycles || 3,
+      restartCooldownMs: config.restartCooldownMs || 30000,
+      logger: this.config.logger,
+    });  // Global health monitoring
 
     // Callbacks
     this.tickerCallbacks = [];
@@ -198,6 +209,12 @@ class SubscriptionEngine {
     if (this.healthCheckInterval) {
       clearInterval(this.healthCheckInterval);
       this.healthCheckInterval = null;
+    }
+
+    // Clear all retry timers (Stage 3 - RetryTimerRegistry)
+    const result = this.timerRegistry.cancelAllTimers();
+    if (result.totalCancelled > 0) {
+      this.config.logger('debug', `SubscriptionEngine: Cancelled ${result.totalCancelled} pending retry timers`);
     }
 
     // Close adapter pool (closes all per-batch adapters)
@@ -383,6 +400,13 @@ class SubscriptionEngine {
           }
         }
       }
+
+      // Stage 3: Evaluate global health ratio (triggers restart if degraded)
+      this._evaluateHealthRatio().catch(error => {
+        this.config.logger('error', `SubscriptionEngine: Health ratio evaluation error`, {
+          error: error.message,
+        });
+      });
     }, this.config.healthCheckIntervalMs || 15000);
   }
 
@@ -448,6 +472,59 @@ class SubscriptionEngine {
    */
   _sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Evaluate global health ratio and trigger restart if needed (Stage 3)
+   * Called from health check interval
+   * @private
+   */
+  async _evaluateHealthRatio() {
+    if (!this.isRunning) return;
+
+    const batchHealth = this.adapterPool.getAllBatchHealth();
+    if (batchHealth.length === 0) return;
+
+    const decision = this.healthRatioPolicy.evaluate(batchHealth);
+
+    if (decision.shouldRestart) {
+      this.config.logger('warn', `SubscriptionEngine: Health ratio trigger restart [${decision.reason}]`, {
+        healthy: decision.healthy,
+        total: decision.total,
+        ratio: decision.ratio,
+      });
+
+      this.metrics.ratioRestartCount = (this.metrics.ratioRestartCount || 0) + 1;
+
+      // Controlled recycle: stop + restart subscriptions (if batches still exist)
+      if (this.subscriptionLoops.size > 0) {
+        try {
+          const batches = Array.from(this.subscriptionLoops.values()).map(loop => loop.symbols);
+          await this.stopSubscriptions();
+          // Small delay before restart
+          await this._sleep(1000);
+          await this.startSubscriptions(batches);
+        } catch (error) {
+          this.config.logger('error', `SubscriptionEngine: Error during health ratio restart`, {
+            error: error.message,
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Register a retry timer with the timer registry (Stage 3)
+   * @private
+   */
+  _registerRetryTimer(batchId, delayMs, callback) {
+    const timeoutHandle = setTimeout(() => {
+      this.timerRegistry.removeTimer(batchId, timeoutHandle);
+      callback();
+    }, delayMs);
+
+    this.timerRegistry.registerTimer(batchId, timeoutHandle);
+    return timeoutHandle;
   }
 
   /**

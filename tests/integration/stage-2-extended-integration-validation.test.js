@@ -1,11 +1,11 @@
 /**
- * Stage 3: Resilience & State Machine Tests
+ * Stage 2 Extended: Integration & Validation Tests
  *
- * Comprehensive test suite for per-batch connection isolation, state management,
- * and recovery mechanisms.
+ * Comprehensive test suite for per-batch connection isolation, fairness mechanisms,
+ * and recovery validation.
  *
  * All 5 UC (use case) tests integrated as Jest tests:
- * - UC1: Promise.race() poisoning prevention
+ * - UC1: Promise.race() poisoning prevention (per-symbol fairness)
  * - UC2: Per-batch adapter isolation (blast radius)
  * - UC3: Lifecycle state preservation (refreshMarkets)
  * - UC4: Mid-flight symbol delisting self-healing
@@ -18,7 +18,7 @@ const PerSymbolStrategy = require('../../src/adapters/strategies/per-symbol.stra
 // ============================================================================
 // UC1: Promise.race() Poison Bug - Per-Symbol Error Isolation
 // ============================================================================
-describe('Stage 3 - UC1: Promise.race() Poison Prevention', () => {
+describe('Stage 2 - UC1: Promise.race() Poison Prevention', () => {
   test('healthy symbols bypass fast-failing symbols in promise race', async () => {
     const mockExchange = {
       watchTicker: async (symbol) => {
@@ -79,7 +79,7 @@ describe('Stage 3 - UC1: Promise.race() Poison Prevention', () => {
 // ============================================================================
 // UC2: Blast Radius Isolation - Per-Batch Adapter Isolation
 // ============================================================================
-describe('Stage 3 - UC2: Per-Batch Adapter Isolation (Blast Radius)', () => {
+describe('Stage 2 - UC2: Per-Batch Adapter Isolation (Blast Radius)', () => {
   test('batch adapter crash does not affect other batches', async () => {
     let adapterInstancesCount = 0;
     const adapters = [];
@@ -173,7 +173,7 @@ describe('Stage 3 - UC2: Per-Batch Adapter Isolation (Blast Radius)', () => {
 // ============================================================================
 // UC3: Lifecycle State Preservation - refreshMarkets() safety
 // ============================================================================
-describe('Stage 3 - UC3: Lifecycle State Preservation', () => {
+describe('Stage 2 - UC3: Lifecycle State Preservation', () => {
   test('refreshMarkets respects lifecycle state when engine not running', async () => {
     let loadMarketsCalls = 0;
     const mockAdapterFactory = () => ({
@@ -220,7 +220,7 @@ describe('Stage 3 - UC3: Lifecycle State Preservation', () => {
 // ============================================================================
 // UC4: Mid-Flight Self-Healing - Symbol Delisting During Stream
 // ============================================================================
-describe('Stage 3 - UC4: Mid-Flight Symbol Delisting Self-Healing', () => {
+describe('Stage 2 - UC4: Mid-Flight Symbol Delisting Self-Healing', () => {
   test('engine recovers when symbol is delisted mid-stream', async () => {
     const mockAdapterFactory = () => ({
       id: 'binance',
@@ -290,7 +290,7 @@ describe('Stage 3 - UC4: Mid-Flight Symbol Delisting Self-Healing', () => {
 // ============================================================================
 // UC5: Memory Leak Check - Dynamic Market Scaling (Accordion Effect)
 // ============================================================================
-describe('Stage 3 - UC5: Memory Leak Prevention (Accordion Effect)', () => {
+describe('Stage 2 - UC5: Memory Leak Prevention (Accordion Effect)', () => {
   test('adapter pool correctly removes adapters when markets shrink', async () => {
     let createdAdapters = 0;
     let closedAdapters = 0;
