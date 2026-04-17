@@ -980,7 +980,8 @@ describe('2D: Per-Batch Adapter Isolation - AdapterPool', () => {
       const health0 = pool.getHealthForBatch('batch-0');
       const health1 = pool.getHealthForBatch('batch-1');
 
-      expect(health0.state).toBe('recovering');
+      // In Stage 3, failed → connecting (not directly to recovering)
+      expect(health0.state).toBe('connecting');
       expect(health0.errorCount).toBe(0);
       expect(health1.state).toBe('failed'); // Still failed
       expect(health1.errorCount).toBe(1); // Not reset
@@ -1036,17 +1037,18 @@ describe('2D: Per-Batch Adapter Isolation - AdapterPool', () => {
       // Create 3 batches first
       const w0 = await pool.getBatchAdapter('batch-0'); // idle (default)
       const w1 = await pool.getBatchAdapter('batch-1'); // will be failed
-      const w2 = await pool.getBatchAdapter('batch-2'); // will be recovering
+      const w2 = await pool.getBatchAdapter('batch-2'); // will be connecting (after recovery attempt from idle)
 
       // Now apply state changes
       pool.recordErrorForBatch('batch-1', new Error('Err')); // failed
-      pool.resetBatchForRecovery('batch-2'); // recovering
+      pool.resetBatchForRecovery('batch-2'); // idle → connecting (Stage 3 transition)
 
       const metrics = pool.getMetrics();
 
       expect(metrics.totalBatches).toBe(3);
       // Check that all batches are accounted for
-      expect(metrics.byState.idle + metrics.byState.failed + metrics.byState.recovering).toBe(3);
+      // In Stage 3: idle + failed + connecting
+      expect(metrics.byState.idle + metrics.byState.failed + metrics.byState.connecting).toBe(3);
     });
   });
 
@@ -1174,7 +1176,8 @@ describe('2D: Per-Batch Adapter Isolation - AdapterPool', () => {
       pool.resetBatchForRecovery('batch-0');
 
       const healthAfterRecover = pool.getHealthForBatch('batch-0');
-      expect(healthAfterRecover.state).toBe('recovering');
+      // In Stage 3, failed → connecting (not directly to recovering)
+      expect(healthAfterRecover.state).toBe('connecting');
       expect(healthAfterRecover.errorCount).toBe(0);
 
       // Batch-1 continues unaffected
@@ -1934,7 +1937,7 @@ describe('Stage 2: Real Runtime Component Integration Tests', () => {
     expect(health0.errorCount).toBe(0);
     expect(health1.errorCount).toBe(2);
     expect(health1.state).toBe('failed');
-    expect(health0.state).toBe('idle');
+    expect(health0.state).toBe('subscribed');  // Changed from 'idle' to 'subscribed' (Stage 3 state alignment)
 
     await pool.close();
   });
@@ -2009,7 +2012,7 @@ describe('Stage 2: Real Runtime Component Integration Tests', () => {
     expect(batchCalls['DOGE/USDT']).toBeGreaterThanOrEqual(batchCalls['SOL/USDT']); // DOGE called way more than SOL
   });
 
-  test('Real estate state machine: idle -> subscribing -> failed -> recovering', async () => {
+  test('Real estate state machine: idle -> connecting -> failed -> recovering', async () => {
     // Real state transitions (not mock setup)
     const pool = new AdapterPool(async () => ({}));
     await pool.initialize();
@@ -2018,17 +2021,20 @@ describe('Stage 2: Real Runtime Component Integration Tests', () => {
     const batch = await pool.getBatchAdapter('batch-0');
     expect(batch.state).toBe('idle');
 
-    // State 2: subscribing
-    batch.state = 'subscribing';
-    expect(batch.state).toBe('subscribing');
+    // State 2: connecting (simulating subscription start)
+    // Note: In real flow, this happens via subscribeForBatch()
+    batch.stateMachine.transition('connecting', 'subscription initiated');
+    batch.state = batch.stateMachine.getState();
+    expect(batch.state).toBe('connecting');
 
     // State 3: failed (record error)
     pool.recordErrorForBatch('batch-0', new Error('Connection failed'));
     expect(batch.state).toBe('failed');
 
-    // State 4: recovering (reset)
+    // State 4: recovering (reset - from failed goes to connecting, not directly to recovering)
+    // In Stage 3, failed → connecting (retry), not failed → recovering
     pool.resetBatchForRecovery('batch-0');
-    expect(batch.state).toBe('recovering');
+    expect(batch.state).toBe('connecting');
 
     await pool.close();
   });

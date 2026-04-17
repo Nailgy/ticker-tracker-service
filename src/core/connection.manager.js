@@ -163,6 +163,11 @@ class ConnectionManager {
         });
       };
 
+      // Extract Stage 3 per-exchange config
+      const { getHealthRatioPolicy, getStaleWatchdogConfig } = require('../constants/exchanges');
+      const healthRatioPolicyConfig = getHealthRatioPolicy(this.config.exchange);
+      const staleWatchdogConfig = getStaleWatchdogConfig(this.config.exchange);
+
       this.#subscriptionEngine = this.config.subscriptionEngineFactory
         ? this.config.subscriptionEngineFactory()
         : new SubscriptionEngine(
@@ -177,6 +182,9 @@ class ConnectionManager {
             healthCheckIntervalMs: this.config.healthCheckIntervalMs,
             healthCheckTimeoutMs: this.config.healthCheckTimeoutMs,
             logger: this.config.logger,
+            // Stage 3 per-exchange config
+            healthRatioPolicyConfig: healthRatioPolicyConfig,
+            staleWatchdogConfig: staleWatchdogConfig,
           }
         );
 

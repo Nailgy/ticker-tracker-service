@@ -50,6 +50,7 @@ describe('SubscriptionEngine', () => {
       recordErrorForBatch: jest.fn(),
       resetBatchForRecovery: jest.fn(),
       getAllBatchHealth: jest.fn().mockReturnValue([]),
+      checkStaleEscalation: jest.fn().mockReturnValue({ action: 'none' }),
       close: jest.fn().mockResolvedValue(undefined),
     };
     AdapterPool.mockImplementation(() => mockAdapterPool);
@@ -321,14 +322,20 @@ describe('SubscriptionEngine', () => {
       mockAdapterPool.getAllBatchHealth.mockReturnValue([
         {
           id: 'batch-0',
-          state: 'idle',
-          isStale: true,
+          state: 'subscribed',
           timeSinceLastDataMs: 120000,
           errorCount: 0,
           retryAttempts: 0,
           lastError: null,
         },
       ]);
+
+      // Mock escalation: stale condition triggers recovery action
+      mockAdapterPool.checkStaleEscalation.mockReturnValue({
+        action: 'recover',
+        level: 'RECOVERING',
+        reason: 'stale condition detected, escalated to recovery',
+      });
 
       engine.subscriptionLoops.set('batch-0', {
         symbols: ['BTC/USDT'],
@@ -349,14 +356,20 @@ describe('SubscriptionEngine', () => {
       mockAdapterPool.getAllBatchHealth.mockReturnValue([
         {
           id: 'batch-0',
-          state: 'idle',
-          isStale: true,
+          state: 'subscribed',
           timeSinceLastDataMs: 120000,
           errorCount: 0,
           retryAttempts: 0,
           lastError: null,
         },
       ]);
+
+      // Mock escalation: stale condition triggers recovery action
+      mockAdapterPool.checkStaleEscalation.mockReturnValue({
+        action: 'recover',
+        level: 'RECOVERING',
+        reason: 'no data for 60s, escalated from WARNED',
+      });
 
       const callback = jest.fn();
       engine.onHealthCheck(callback);
@@ -369,24 +382,29 @@ describe('SubscriptionEngine', () => {
       engine._startHealthCheck();
       jest.advanceTimersByTime(engine.config.healthCheckIntervalMs);
 
-      expect(callback).toHaveBeenCalledWith('batch-0', { stale: true });
+      expect(callback).toHaveBeenCalledWith('batch-0', { stale: true, action: 'recover' });
     });
 
     test('should recover from stale state when data flows', () => {
       engine.isRunning = true;
 
-      // Mock AdapterPool health data showing recovered state
+      // Mock AdapterPool health data showing recovered state (no escalation action needed)
       mockAdapterPool.getAllBatchHealth.mockReturnValue([
         {
           id: 'batch-0',
-          state: 'recovering',
-          isStale: false,
+          state: 'subscribed',
           timeSinceLastDataMs: 5000,
           errorCount: 0,
           retryAttempts: 0,
           lastError: null,
         },
       ]);
+
+      // Mock escalation: no action (batch is healthy)
+      mockAdapterPool.checkStaleEscalation.mockReturnValue({
+        action: 'none',
+        level: 'HEALTHY',
+      });
 
       engine.subscriptionLoops.set('batch-0', {
         symbols: ['BTC/USDT'],
@@ -396,7 +414,7 @@ describe('SubscriptionEngine', () => {
       engine._startHealthCheck();
       jest.advanceTimersByTime(engine.config.healthCheckIntervalMs);
 
-      // Verify stale is not detected again (no recovery callback)
+      // Verify stale recovery callback not called (no stale condition)
       expect(mockAdapterPool.resetBatchForRecovery).not.toHaveBeenCalled();
     });
   });

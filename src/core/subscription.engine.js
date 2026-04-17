@@ -47,13 +47,6 @@ class SubscriptionEngine {
       subscriptionDelay: config.subscriptionDelay || 100,
     };
 
-    // Adapter pool for per-batch connection isolation (CRITICAL: Stage 2 Per-Connection)
-    // Each batch gets its OWN adapter instance via factory
-    this.adapterPool = new AdapterPool(
-      this.adapterFactory,  // Factory creates NEW adapters per batch
-      this.config
-    );
-
     // Exchange metadata (same for all batches, set when first adapter created)
     this.exchangeId = null;
     this.marketType = null;
@@ -70,14 +63,31 @@ class SubscriptionEngine {
       maxDelayMs: this.config.retryMaxDelayMs,
     });
 
-    // Stage 3 Resilience Modules
-    this.timerRegistry = new RetryTimerRegistry({ logger: this.config.logger });  // Track per-batch retry timers
+    // Stage 3 Resilience Modules - CREATE BEFORE AdapterPool
+    this.timerRegistry = new RetryTimerRegistry({ logger: this.config.logger });
+
+    // Use per-exchange health ratio policy config if provided
+    const healthRatioCfg = config.healthRatioPolicyConfig || {};
     this.healthRatioPolicy = new HealthRatioPolicy({
-      minHealthyRatio: config.minHealthyRatio || 0.5,
-      ratioBreachCycles: config.ratioBreachCycles || 3,
-      restartCooldownMs: config.restartCooldownMs || 30000,
+      minHealthyRatio: healthRatioCfg.minHealthyRatio || 0.5,
+      ratioBreachCycles: healthRatioCfg.ratioBreachCycles || 3,
+      restartCooldownMs: healthRatioCfg.restartCooldownMs || 30000,
       logger: this.config.logger,
-    });  // Global health monitoring
+    });
+
+    // Store stale watchdog config for AdapterPool
+    this.config.staleWatchdogConfig = config.staleWatchdogConfig || {};
+
+    // Adapter pool for per-batch connection isolation (CRITICAL: Stage 2 Per-Connection)
+    // Each batch gets its OWN adapter instance via factory
+    // NOW has all Stage 3 resilience modules available (timer registry, stale config)
+    this.adapterPool = new AdapterPool(
+      this.adapterFactory,  // Factory creates NEW adapters per batch
+      {
+        ...this.config,
+        timerRegistry: this.timerRegistry,  // Pass timer registry for lifecycle cleanup
+      }
+    );
 
     // Callbacks
     this.tickerCallbacks = [];
@@ -267,12 +277,17 @@ class SubscriptionEngine {
 
           if (activeSymbols.length === 0) {
             this.config.logger('warn', `SubscriptionEngine: All symbols non-retryable [${batchId}]`);
-            await this._sleep(5000);
+            // Use registered timer instead of blocking sleep
+            await new Promise(resolve => {
+              this._registerRetryTimer(batchId, 5000, resolve);
+            });
             continue;
           }
 
-          // Subscribe using THIS BATCH'S adapter (per-connection isolation)
-          for await (const { symbol, ticker } of batchAdapter.subscribe(activeSymbols)) {
+          // Subscribe through AdapterPool (sets state to 'connecting' before first data)
+          // This ensures state machine is authoritative: connecting → subscribed on first data
+          const subscription = await this.adapterPool.subscribeForBatch(batchId, activeSymbols);
+          for await (const { symbol, ticker } of subscription) {
             if (!this.isRunning) break;
 
             // Update batch-local health
@@ -329,7 +344,9 @@ class SubscriptionEngine {
             }
 
             // Don't backoff for non-retryable errors
-            await this._sleep(1000);
+            await new Promise(resolve => {
+              this._registerRetryTimer(batchId, 1000, resolve);
+            });
           } else {
             // Retryable error - apply exponential backoff
             loopState.retryAttempts++;
@@ -341,7 +358,9 @@ class SubscriptionEngine {
             });
 
             this.metrics.retryQueue++;
-            await this._sleep(delay);
+            await new Promise(resolve => {
+              this._registerRetryTimer(batchId, delay, resolve);
+            });
             this.metrics.retryQueue--;
           }
         }
@@ -358,8 +377,9 @@ class SubscriptionEngine {
   }
 
   /**
-   * Global health check - per-batch stale detection (via AdapterPool)
+   * Global health check - per-batch stale detection via escalation (via AdapterPool)
    * Each batch has isolated health state (per-connection)
+   * Uses stale watchdog escalation: WARN → RECOVER → FAIL
    *
    * @private
    */
@@ -371,26 +391,49 @@ class SubscriptionEngine {
       const allBatchHealth = this.adapterPool.getAllBatchHealth();
 
       for (const health of allBatchHealth) {
-        if (health.isStale) {
-          if (health.state !== 'stale') {
-            // First time detecting stale for this batch
-            this.metrics.staleDetections++;
+        // Use escalation model instead of simple isStale check
+        const escalation = this.adapterPool.checkStaleEscalation(health.id);
 
-            this.config.logger('warn', `SubscriptionEngine: Stale connection detected [${health.id}]`, {
-              timeSinceLastMessageMs: health.timeSinceLastDataMs,
-              thresholdMs: this.config.healthCheckTimeoutMs,
+        if (escalation && escalation.action) {
+          this.config.logger('debug', `SubscriptionEngine: Stale escalation check [${health.id}]`, {
+            action: escalation.action,
+            level: escalation.level,
+            reason: escalation.reason,
+          });
+
+          if (escalation.action === 'recover') {
+            // Per-batch recovery attempt - escalated from WARNED
+            this.metrics.staleDetections++;
+            this.config.logger('warn', `SubscriptionEngine: Escalated to recovery [${health.id}]`, {
+              level: escalation.level,
+              reason: escalation.reason,
             });
 
-            // Mark batch as stale in pool (isolated recovery)
+            // Attempt per-batch recovery
             this.adapterPool.resetBatchForRecovery(health.id);
-
-            // Note: Per-batch adapters are managed by AdapterPool
-            // Each batch's adapter handles its own reconnection
 
             // Call health check callbacks
             for (const callback of this.healthCheckCallbacks) {
               try {
-                callback(health.id, { stale: true });
+                callback(health.id, { stale: true, action: 'recover' });
+              } catch (cbError) {
+                this.config.logger('error', `SubscriptionEngine: Health check callback error`, {
+                  error: cbError.message,
+                });
+              }
+            }
+          } else if (escalation.action === 'fail') {
+            // Escalated to FAILED - transition batch state and let global health ratio policy handle restart
+            this.adapterPool.transitionBatchToFailed(health.id, escalation.reason);
+
+            this.config.logger('warn', `SubscriptionEngine: Batch escalated to FAILED [${health.id}]`, {
+              reason: escalation.reason,
+            });
+
+            // Call health check callbacks for monitoring
+            for (const callback of this.healthCheckCallbacks) {
+              try {
+                callback(health.id, { stale: true, action: 'fail' });
               } catch (cbError) {
                 this.config.logger('error', `SubscriptionEngine: Health check callback error`, {
                   error: cbError.message,
@@ -398,6 +441,7 @@ class SubscriptionEngine {
               }
             }
           }
+          // action === 'warn' means just log, don't recover yet - next cycle will escalate
         }
       }
 

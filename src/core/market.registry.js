@@ -70,14 +70,21 @@ class MarketRegistry {
       const markets = await adapter.loadMarkets();
       const symbols = markets.map(m => m.symbol);
 
-      this.desiredSymbols = new Set(symbols);
+      // Filter out non-retryable symbols to keep them permanently evicted
+      const filtered = symbols.filter(s => !this.nonRetryableSymbols.has(s));
+      this.desiredSymbols = new Set(filtered);
       this._updateMetrics();
+
+      if (symbols.length !== filtered.length) {
+        this.config.logger('info', `MarketRegistry: Filtered ${symbols.length - filtered.length} non-retryable symbols from desired markets`);
+      }
 
       this.config.logger('info', `MarketRegistry: Desired markets loaded`, {
         symbolCount: this.desiredSymbols.size,
+        filteredCount: symbols.length - filtered.length,
       });
 
-      return { symbols, count: symbols.length };
+      return { symbols: filtered, count: filtered.length };
     } catch (error) {
       this.config.logger('error', `MarketRegistry: Failed to load desired markets`, {
         error: error.message,
@@ -98,12 +105,15 @@ class MarketRegistry {
     const added = [];
 
     for (const symbol of symbols) {
+      // Prevent re-adding non-retryable symbols (hard eviction)
+      if (this.nonRetryableSymbols.has(symbol)) {
+        this.config.logger('debug', `MarketRegistry: Skipping non-retryable symbol [${symbol}]`);
+        continue;
+      }
+
       if (!this.activeSymbols.has(symbol)) {
         this.activeSymbols.add(symbol);
         added.push(symbol);
-
-        // Remove from non-retryable if it was there (re-enabling)
-        this.nonRetryableSymbols.delete(symbol);
       }
     }
 

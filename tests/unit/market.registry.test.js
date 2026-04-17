@@ -102,13 +102,16 @@ describe('MarketRegistry', () => {
       expect(registry.getActiveSymbols().size).toBe(0);
     });
 
-    it('should re-enable non-retryable symbol when re-added', () => {
+    it('should prevent re-adding non-retryable symbols (Stage 3 hard eviction)', () => {
       registry.addSymbols(['BTC/USDT']);
       registry.markNonRetryable(['BTC/USDT']);
+
+      // Attempt to re-add non-retryable symbol
       registry.addSymbols(['BTC/USDT']);
 
-      expect(registry.getActiveSymbols().has('BTC/USDT')).toBe(true);
-      expect(registry.getNonRetryableSymbols().has('BTC/USDT')).toBe(false);
+      // Symbol should remain non-retryable (hard eviction)
+      expect(registry.getActiveSymbols().has('BTC/USDT')).toBe(false);
+      expect(registry.getNonRetryableSymbols().has('BTC/USDT')).toBe(true);
     });
   });
 

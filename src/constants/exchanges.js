@@ -155,10 +155,34 @@ function supportsMarketType(exchangeName, marketType) {
   return config.supportedMarketTypes.includes(marketType.toLowerCase());
 }
 
+/**
+ * Get per-exchange health ratio policy config (Stage 3)
+ */
+function getHealthRatioPolicy(exchangeName) {
+  const config = EXCHANGE_CONFIGS[exchangeName] || EXCHANGE_CONFIGS.default;
+  return config.healthRatioPolicy || {
+    minHealthyRatio: 0.5,
+    ratioBreachCycles: 3,
+    restartCooldownMs: 30000,
+  };
+}
+
+/**
+ * Get per-exchange stale watchdog config (Stage 3)
+ */
+function getStaleWatchdogConfig(exchangeName) {
+  const config = EXCHANGE_CONFIGS[exchangeName] || EXCHANGE_CONFIGS.default;
+  return config.staleWatchdog || {
+    staleTimeoutMs: 60000,
+  };
+}
+
 module.exports = {
   EXCHANGE_CONFIGS,
   STRATEGY_MODES,
   getResilienceConfig,
   getWatchMode,
   supportsMarketType,
+  getHealthRatioPolicy,
+  getStaleWatchdogConfig,
 };

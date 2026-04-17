@@ -99,19 +99,19 @@ class ConnectionStateMachine {
   /**
    * Get transition history with optional filtering
    * @param {Object} filter - Filter options
-   * @param {string} filter.fromState - Filter by source state
-   * @param {string} filter.toState - Filter by destination state
+   * @param {string} filter.from - Filter by source state
+   * @param {string} filter.to - Filter by destination state
    * @param {string} filter.reason - Filter by reason substring
    * @returns {Array} Filtered transition records
    */
   getTransitionHistoryFiltered(filter = {}) {
     let history = this.transitionHistory;
 
-    if (filter.fromState) {
-      history = history.filter(rec => rec.from === filter.fromState);
+    if (filter.from) {
+      history = history.filter(rec => rec.from === filter.from);
     }
-    if (filter.toState) {
-      history = history.filter(rec => rec.to === filter.toState);
+    if (filter.to) {
+      history = history.filter(rec => rec.to === filter.to);
     }
     if (filter.reason) {
       history = history.filter(rec =>

@@ -38,6 +38,7 @@ class AdapterPool {
     this.adapterFactory = adapterFactory;  // Function that CREATES NEW adapters
     this.config = config;
     this.logger = config.logger || this._defaultLogger;
+    this.timerRegistry = config.timerRegistry || null;  // Optional timer registry for cleanup
 
     this.adapters = new Map(); // Map<batchId, {id, adapter, state, health, subscriptionPromise}>
     this.isInitialized = false;
@@ -93,7 +94,8 @@ class AdapterPool {
           stateMachine: new ConnectionStateMachine(batchId, { logger: this.logger }), // State machine with guarded transitions
           staleWatchdog: new StaleWatchdog(batchId, {
             logger: this.logger,
-            staleTimeoutMs: this.config.staleTimeoutMs || 60000
+            // Use per-exchange stale watchdog config if provided (Stage 3)
+            staleTimeoutMs: this.config.staleWatchdogConfig?.staleTimeoutMs || 60000
           }), // Escalation-based stale detection
           state: 'idle', // idle | subscribing | stale | failed | recovering (kept for compatibility)
           health: {
@@ -118,15 +120,18 @@ class AdapterPool {
   /**
    * Start subscription for batch (returns async generator for that batch)
    * Each batch uses its OWN adapter instance
+   * CRITICAL: State machine is authoritative - transition must be called
    */
   async subscribeForBatch(batchId, symbols) {
     const wrapper = await this.getBatchAdapter(batchId);  // Get this batch's unique adapter
 
-    if (wrapper.state === 'subscribing') {
-      throw new Error(`Batch ${batchId} already subscribing`);
+    if (wrapper.stateMachine.getState() === 'connecting') {
+      throw new Error(`Batch ${batchId} already connecting`);
     }
 
-    wrapper.state = 'subscribing';
+    // State machine is authoritative - enforce guarded transition
+    wrapper.stateMachine.transition('connecting', 'subscription initiated');
+    wrapper.state = wrapper.stateMachine.getState();
     wrapper.health.retryAttempts = 0;
 
     // Return async generator from this batch's OWN adapter
@@ -136,29 +141,50 @@ class AdapterPool {
   /**
    * Record successful data reception for batch (batch-local health update)
    * When this batch gets data, only THIS batch's health improves
+   *
+   * CRITICAL: State machine is authoritative - no try/catch, transitions must be legal.
+   * If transition fails, it's a CODE BUG that should be visible immediately.
    */
   recordDataForBatch(batchId) {
     const wrapper = this.adapters.get(batchId);
     if (wrapper) {
       wrapper.health.lastDataAt = Date.now();
       wrapper.health.errorCount = 0;
-      wrapper.state = 'idle';
       wrapper.staleWatchdog.recordData();  // Reset escalation level
 
-      // Attempt state machine transition to idle state
-      try {
-        if (wrapper.stateMachine.getState() !== 'idle') {
-          wrapper.stateMachine.transition('idle', 'data received, health recovered');
+      // State machine is authoritative - enforce guarded transition
+      const currentState = wrapper.stateMachine.getState();
+      if (currentState === 'idle') {
+        // First time receiving data - idle → connecting → subscribed
+        wrapper.stateMachine.transition('connecting', 'data received, initializing subscription');
+        wrapper.stateMachine.transition('subscribed', 'data received, subscription established');
+      } else if (currentState === 'connecting') {
+        // Still connecting - connecting → subscribed
+        wrapper.stateMachine.transition('subscribed', 'data received, subscription established');
+      } else if (currentState !== 'subscribed') {
+        // From stale/recovering/failed, try to recover to subscribed
+        try {
+          wrapper.stateMachine.transition('subscribed', 'data received, health recovered');
+        } catch (error) {
+          // Some states may not allow direct transition to subscribed (e.g., failed)
+          // This is expected in some scenarios
+          this.logger('debug', `AdapterPool: Could not transition to subscribed from ${currentState}`, {
+            batchId,
+            error: error.message,
+          });
         }
-      } catch (error) {
-        this.logger('debug', `AdapterPool: State transition to idle failed for ${batchId}`, { error: error.message });
       }
+      // wrapper.state syncs with stateMachine.getState() via getBatchState() calls
+      wrapper.state = wrapper.stateMachine.getState();
     }
   }
 
   /**
    * Record error for batch (batch-local error tracking)
    * Error in this batch's connection doesn't affect other batches' connections
+   *
+   * CRITICAL: State machine is authoritative - no try/catch, transitions must be legal.
+   * If transition fails, it's a CODE BUG that should be visible immediately.
    */
   recordErrorForBatch(batchId, error) {
     const wrapper = this.adapters.get(batchId);
@@ -166,24 +192,50 @@ class AdapterPool {
       wrapper.health.errorCount++;
       wrapper.health.lastError = error;
       wrapper.health.retryAttempts++;
-      wrapper.state = 'failed';
 
-      // Attempt state machine transition to failed state
-      try {
-        const currentState = wrapper.stateMachine.getState();
-        if (currentState !== 'failed') {
-          wrapper.stateMachine.transition('failed', `error: ${error.message}`, {
-            errorName: error.name,
-            retryAttempt: wrapper.health.retryAttempts
-          });
-        }
-      } catch (error) {
-        this.logger('debug', `AdapterPool: State transition to failed failed for ${batchId}`, { error: error.message });
+      // State machine is authoritative - enforce guarded transition
+      const currentState = wrapper.stateMachine.getState();
+      if (currentState !== 'failed') {
+        wrapper.stateMachine.transition('failed', `error: ${error.message}`, {
+          errorName: error.name,
+          retryAttempt: wrapper.health.retryAttempts
+        });
       }
+      // wrapper.state syncs with stateMachine.getState() via getBatchState() calls
+      wrapper.state = wrapper.stateMachine.getState();
 
       this.logger('warn', `AdapterPool: Error for batch [${batchId}] (attempt ${wrapper.health.retryAttempts})`, {
         error: error.message,
       });
+    }
+  }
+
+  /**
+   * Transition batch to failed state (for stale escalation)
+   * Called when stale watchdog escalates to FAILED level
+   * CRITICAL: Updates both state machine AND wrapper.state to keep in sync
+   */
+  transitionBatchToFailed(batchId, reason = 'stale escalation') {
+    const wrapper = this.adapters.get(batchId);
+    if (!wrapper) {
+      return;
+    }
+
+    const currentState = wrapper.stateMachine.getState();
+    if (currentState !== 'failed') {
+      try {
+        wrapper.stateMachine.transition('failed', reason);
+        wrapper.state = wrapper.stateMachine.getState();
+
+        this.logger('warn', `AdapterPool: Batch transitioned to FAILED [${batchId}]`, {
+          reason: reason,
+          previousState: currentState,
+        });
+      } catch (error) {
+        this.logger('error', `AdapterPool: Failed to transition batch to failed [${batchId}]`, {
+          error: error.message,
+        });
+      }
     }
   }
 
@@ -283,31 +335,68 @@ class AdapterPool {
   /**
    * Reset batch to recover from failure (batch-local recovery)
    * Doesn't affect other batches' connections
+   *
+   * CRITICAL: Enforces legal state transitions via state machine.
+   * Each state path must follow the legal transitions defined in ConnectionStateMachine.
    */
   resetBatchForRecovery(batchId) {
     const wrapper = this.adapters.get(batchId);
-    if (wrapper) {
-      wrapper.state = 'recovering';
-      wrapper.health.lastDataAt = Date.now();
-      wrapper.health.errorCount = 0;
-      // Note: Don't reset retryAttempts - use for exponential backoff
+    if (!wrapper) return;
 
-      // Attempt state machine transition to recovering state
-      try {
-        const currentState = wrapper.stateMachine.getState();
-        if (currentState !== 'recovering' && currentState !== 'idle') {
-          wrapper.stateMachine.transition('recovering', 'per-batch recovery attempt');
-        }
-      } catch (error) {
-        this.logger('debug', `AdapterPool: State transition to recovering failed for ${batchId}`, { error: error.message });
+    wrapper.health.lastDataAt = Date.now();
+    wrapper.health.errorCount = 0;
+    // Note: Don't reset retryAttempts - use for exponential backoff
+
+    const currentState = wrapper.stateMachine.getState();
+
+    try {
+      if (currentState === 'subscribed') {
+        // Stale while subscribed: subscribed → stale → recovering
+        // (data arrives but becomes stale, need recovery)
+        wrapper.stateMachine.transition('stale', 'stale detected during subscription');
+        wrapper.stateMachine.transition('recovering', 'per-batch recovery attempt');
+      } else if (currentState === 'stale') {
+        // Already stale: stale → recovering
+        // (escalation has occurred, begin recovery)
+        wrapper.stateMachine.transition('recovering', 'per-batch recovery attempt');
+      } else if (currentState === 'failed') {
+        // Failed: failed → connecting (reconnect attempt)
+        // (batch failed, restart connection from beginning)
+        wrapper.stateMachine.transition('connecting', 'reconnection attempt after failure');
+      } else if (currentState === 'idle') {
+        // Shouldn't normally happen, but if so: idle → connecting
+        // (initial attempt or reset state, start fresh connection)
+        wrapper.stateMachine.transition('connecting', 'initial connection attempt');
       }
+      // For 'connecting', 'recovering': already in intermediate state, no action needed
+      // These states are transient and will progress naturally
+
+      wrapper.state = wrapper.stateMachine.getState();
+    } catch (error) {
+      this.logger(
+        'error',
+        `AdapterPool: Recovery transition failed for ${batchId}`,
+        { error: error.message, currentState }
+      );
+      // Don't throw - recovery attempt failed, will be retried on next health check
     }
   }
 
   /**
    * Remove batch from tracking (batch completed or removed)
+   * CRITICAL: Cancels pending timers for this batch if timerRegistry available (Stage 3)
    */
   async removeBatch(batchId) {
+    // Cancel pending timers for this batch (Stage 3 - prevent orphaned callbacks)
+    if (this.timerRegistry && this.timerRegistry.cancelBatchTimers) {
+      try {
+        this.timerRegistry.cancelBatchTimers(batchId);
+      } catch (error) {
+        this.logger('warn', `AdapterPool: Error cancelling timers for ${batchId}`, { error: error.message });
+      }
+    }
+
+    // Close adapter
     const wrapper = this.adapters.get(batchId);
     if (wrapper && wrapper.adapter && wrapper.adapter.close) {
       try {
@@ -330,11 +419,11 @@ class AdapterPool {
   }
 
   /**
-   * Check if batch is currently subscribing
+   * Check if batch is currently connecting
    */
   isBatchSubscribing(batchId) {
     const wrapper = this.adapters.get(batchId);
-    return wrapper?.state === 'subscribing';
+    return wrapper?.state === 'connecting';
   }
 
   /**
@@ -345,7 +434,8 @@ class AdapterPool {
       totalBatches: this.adapters.size,
       byState: {
         idle: 0,
-        subscribing: 0,
+        connecting: 0,
+        subscribed: 0,
         stale: 0,
         failed: 0,
         recovering: 0,
