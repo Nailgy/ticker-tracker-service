@@ -75,17 +75,29 @@ class PerSymbolStrategy extends Strategy {
 
     // Create wrapped promises that NEVER reject (always resolve to {success, ...})
     const createWrappedWatchPromise = (symbol) => {
-      return this._watchSymbolSafe(exchange, symbol)
-        .then((ticker) => ({
-          success: true,
-          symbol,
-          ticker,
-        }))
-        .catch((error) => ({
+      try {
+        // Handle both async watchTicker and synchronous errors
+        const watchPromise = this._watchSymbolSafe(exchange, symbol);
+
+        return Promise.resolve(watchPromise)
+          .then((ticker) => ({
+            success: true,
+            symbol,
+            ticker,
+          }))
+          .catch((error) => ({
+            success: false,
+            symbol,
+            error: error instanceof Error ? error : new Error(String(error)),
+          }));
+      } catch (syncError) {
+        // Handle synchronous errors (shouldn't happen, but be safe)
+        return Promise.resolve({
           success: false,
           symbol,
-          error: error instanceof Error ? error : new Error(String(error)),
-        }));
+          error: syncError instanceof Error ? syncError : new Error(String(syncError)),
+        });
+      }
     };
 
     // Initialize pending map with wrapped promises (never reject)
@@ -95,6 +107,9 @@ class PerSymbolStrategy extends Strategy {
     }
 
     // Main loop: race all symbols, isolate errors per symbol
+    let successCount = 0;  // Track successful results for fairness cycling
+    const failedSymbols = new Set();  // Track permanently failed symbols
+
     while (!this.isClosed && pending.size > 0) {
       let result;
       try {
@@ -121,7 +136,24 @@ class PerSymbolStrategy extends Strategy {
           metrics.isHealthy = true;
         }
 
+        successCount++;
         yield { symbol, ticker };
+
+        // Re-add healthy symbol for next ticker
+        if (!this.isClosed) {
+          pending.set(symbol, createWrappedWatchPromise(symbol));
+        }
+
+        // After N successes, re-add recently-failed symbols for another attempt (fairness cycle)
+        if (successCount % 5 === 0 && failedSymbols.size > 0 && !this.isClosed) {
+          for (const failedSymbol of failedSymbols) {
+            const metrics = this.taskMetrics.get(failedSymbol);
+            if (metrics && metrics.attempts < 5) {
+              pending.set(failedSymbol, createWrappedWatchPromise(failedSymbol));
+              failedSymbols.delete(failedSymbol);
+            }
+          }
+        }
       } else {
         // Failed: track error and log for debugging
         const metrics = this.taskMetrics.get(symbol);
@@ -137,14 +169,19 @@ class PerSymbolStrategy extends Strategy {
           error: error.message,
           attempt: metrics?.attempts || 0,
         });
-      }
 
-      // Re-subscribe to symbol if not closed
-      // This applies to BOTH success and failure cases:
-      // - Success: get next ticker
-      // - Failure: retry independently (no cross-contamination)
-      if (!this.isClosed) {
-        pending.set(symbol, createWrappedWatchPromise(symbol));
+        // CRITICAL FAIRNESS FIX: Don't immediately re-add failed symbols
+        // Remove failed symbol from THIS race (give others a chance)
+        // Track it for potential re-adding after healthy symbols get turns
+        pending.delete(symbol);
+        failedSymbols.add(symbol);
+
+        // Check if max retries reached
+        if (!this.isClosed && metrics && metrics.attempts >= 5) {
+          // Max retries exhausted - remove permanently
+          this.taskMetrics.delete(symbol);
+          failedSymbols.delete(symbol);
+        }
       }
     }
 

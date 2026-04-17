@@ -481,8 +481,14 @@ class ConnectionManager {
    * Get status
    */
   getStatus() {
-    const adapterMetrics = this.#adapter?.getMetrics() || {};
+    // Stage 2: AdapterPool is managed by SubscriptionEngine, get via engine.getStatus()
     const engineStatus = this.#subscriptionEngine?.getStatus() || {};
+
+    // For backward compatibility, extract adapter metrics from engine's adapterPool if available
+    const adapterMetrics = engineStatus.batchHealth ?
+      { batchCount: engineStatus.batchHealth.length } :
+      {};
+
     const registryMetrics = this.#marketRegistry?.getMetrics() || {};
     const writerMetrics = this.#redisWriter?.getMetrics() || {};
 
