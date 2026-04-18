@@ -286,6 +286,7 @@ class ConnectionManager {
 
   /**
    * Refresh markets and reallocate symbols
+   * STAGE 4: Incremental reconciliation without full restart
    */
   async refreshMarkets() {
     if (!this.isInitialized) {
@@ -293,14 +294,32 @@ class ConnectionManager {
     }
 
     try {
-      this.config.logger('debug', `ConnectionManager: Refreshing markets`);
+      this.config.logger('debug', `ConnectionManager: Refreshing markets (Stage 4 - zero downtime)`);
+
+      // CRITICAL: SNAPSHOT MUST BE TAKEN BEFORE ANY MUTATIONS (atomicity requirement)
+      // This captures the TRUE pre-refresh state before loadDesiredMarkets/addSymbols/removeSymbols
+      const registrySnapshot = {
+        desiredSymbols: new Set(this.#marketRegistry.desiredSymbols),
+        activeSymbols: new Set(this.#marketRegistry.activeSymbols),
+        batchAllocations: new Map(
+          Array.from(this.#marketRegistry.batchAllocations.entries()).map(
+            ([batchId, symbols]) => [batchId, new Set(symbols)]  // Deep copy each Set
+          )
+        ),
+        symbolToBatchMap: new Map(this.#marketRegistry.symbolToBatchMap),
+        // CRITICAL: Also snapshot metrics (for full atomic consistency)
+        metrics: { ...this.#marketRegistry.metrics },
+      };
+
+      // Save original #batches BEFORE any mutations (for rollback)
+      const originalBatches = [...this.#batches];
 
       // Get previous state for diffing
       const previousState = {
         desiredSymbols: this.#marketRegistry.getDesiredSymbols(),
       };
 
-      // Load fresh markets
+      // Load fresh markets (Phase 1: reload: true in ccxt.adapter.js)
       await this.#marketRegistry.loadDesiredMarkets(this.#adapter);
 
       // Detect changes
@@ -308,7 +327,6 @@ class ConnectionManager {
 
       if (added.length > 0) {
         this.#marketRegistry.addSymbols(added);
-        this.#createBatches(); // Recalculate batches
         this.config.logger('info', `ConnectionManager: New symbols detected`, {
           count: added.length,
         });
@@ -316,38 +334,74 @@ class ConnectionManager {
 
       if (removed.length > 0) {
         this.#marketRegistry.removeSymbols(removed);
-        this.#createBatches(); // Recalculate batches
         this.config.logger('info', `ConnectionManager: Removed symbols detected`, {
           count: removed.length,
         });
       }
 
-      // Rewire live subscriptions to new batch topology
-      // CRITICAL (Stage 2E): Only reallocate if subscriptions are currently running.
-      // If manager.stop() was called, refreshMarkets must NOT restart subscriptions.
-      // Respect the lifecycle state - don't change isRunning unless manager explicitly told to.
+      // STAGE 4: Incremental reconciliation without restart
+      // STAGE 4: Rebalance with minimal diff (preserves batch IDs, moves only changed symbols)
+      const rebalanceDiff = this.#marketRegistry.rebalance(this.config.batchSize);
+
+      // Build next plan from rebalanced batches
+      const nextPlan = Array.from(this.#marketRegistry.batchAllocations.entries()).map(
+        ([batchId, symbols]) => ({
+          batchId,
+          symbols: Array.from(symbols),
+        })
+      );
+
+      // Update #batches with new plan
+      this.#batches = nextPlan.map(p => p.symbols);
+
       if (added.length > 0 || removed.length > 0) {
         if (!this.isRunning) {
           // Market changes detected but subscriptions are not running.
           // Don't restart them - respect the stopped state.
-          this.config.logger('debug', `ConnectionManager: Market changes detected but subscriptions not running, skipping reallocation`, {
+          // #batches are now fresh for next startup.
+          this.config.logger('debug', `ConnectionManager: Market changes detected but subscriptions not running, skipping reconciliation`, {
             added: added.length,
             removed: removed.length,
           });
           return { added, removed };
         }
 
-        // Only reallocate if manager is currently running
-        if (this.isRunning) {
-          await this.#subscriptionEngine.stopSubscriptions();
-        }
+        try {
+          this.config.logger('debug', `ConnectionManager: Rebalance plan created`, {
+            newBatches: rebalanceDiff.added.length,
+            modifiedBatches: rebalanceDiff.modified.length,
+            unchangedBatches: rebalanceDiff.unchanged.length,
+            removedBatches: rebalanceDiff.removed.length,
+          });
 
-        if (this.#batches.length > 0) {
-          await this.#subscriptionEngine.startSubscriptions(this.#batches);
-          // Note: isRunning stays true (was already true, still true after restart)
-        } else {
-          // All symbols removed - stop subscriptions
-          this.isRunning = false;
+          // STAGE 4: Reconcile subscriptions (add/remove symbols without restart)
+          const reconcileDiff = await this.#subscriptionEngine.reconcileBatches(nextPlan);
+
+          this.config.logger('info', `ConnectionManager: Reconciliation complete (zero downtime)`, {
+            newBatches: reconcileDiff.added.length,
+            modifiedBatches: reconcileDiff.modified.length,
+            unchangedBatches: reconcileDiff.unchanged.length,
+            pausedBatches: reconcileDiff.removed.length,
+          });
+        } catch (reconcileError) {
+          // STAGE 4 FIX #4: Atomic rollback - restore ALL state to pre-refresh
+          // Critical: all mutable state must roll back atomically to keep manager consistent
+          this.config.logger('error', `ConnectionManager: Reconciliation failed, rolling back ALL registry and batch state to pre-refresh`, {
+            error: reconcileError.message,
+          });
+
+          // Restore registry to pre-refresh state (snapshot was taken before all mutations)
+          this.#marketRegistry.batchAllocations = registrySnapshot.batchAllocations;
+          this.#marketRegistry.symbolToBatchMap = registrySnapshot.symbolToBatchMap;
+          this.#marketRegistry.desiredSymbols = registrySnapshot.desiredSymbols;
+          this.#marketRegistry.activeSymbols = registrySnapshot.activeSymbols;
+          // CRITICAL: Restore metrics too (for full atomic state consistency)
+          this.#marketRegistry.metrics = { ...registrySnapshot.metrics };
+
+          // Restore #batches to original state
+          this.#batches = originalBatches;
+
+          throw reconcileError;  // Propagate error to caller
         }
       }
 

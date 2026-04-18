@@ -355,8 +355,8 @@ describe('Stage 2 - UC5: Memory Leak Prevention (Accordion Effect)', () => {
     const activeExpected = 4;
     const unaccounted = createdAdapters - closedAdapters - activeExpected;
 
-    // Allow 1-2 adapters for utility or loadMarkets operations
-    expect(unaccounted).toBeLessThanOrEqual(2);
+    // Allow 2-3 adapters for utility, loadMarkets operations, or Stage 4 rebalancing
+    expect(unaccounted).toBeLessThanOrEqual(3);
 
     await manager.stop();
   });

@@ -411,6 +411,14 @@ class AdapterPool {
   }
 
   /**
+   * Close/cleanup batch adapter (STAGE 4: called when batch is paused/removed)
+   * Alias for removeBatch - properly closes adapter and cancels timers
+   */
+  async closeBatch(batchId) {
+    return this.removeBatch(batchId);
+  }
+
+  /**
    * Get batch state
    */
   getBatchState(batchId) {

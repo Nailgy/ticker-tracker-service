@@ -169,6 +169,8 @@ class SubscriptionEngine {
         this.subscriptionLoops.set(batchId, {
           symbols,
           retryAttempts: 0,
+          lastActiveSymbols: [],  // STAGE 4 FIX #1: Track what we subscribed to
+          paused: false,          // STAGE 4 FIX #2: Track if batch is paused for removal
         });
 
         // Stagger batch startup
@@ -276,6 +278,13 @@ class SubscriptionEngine {
           );
 
           if (activeSymbols.length === 0) {
+            // STAGE 4 FIX #2: Check if batch is being paused for removal
+            if (loopState.paused) {
+              this.config.logger('info', `SubscriptionEngine: Batch paused and empty, exiting loop [${batchId}]`);
+              break;  // Exit while loop cleanly
+            }
+
+            // Not paused, just all non-retryable - wait and retry
             this.config.logger('warn', `SubscriptionEngine: All symbols non-retryable [${batchId}]`);
             // Use registered timer instead of blocking sleep
             await new Promise(resolve => {
@@ -287,8 +296,27 @@ class SubscriptionEngine {
           // Subscribe through AdapterPool (sets state to 'connecting' before first data)
           // This ensures state machine is authoritative: connecting → subscribed on first data
           const subscription = await this.adapterPool.subscribeForBatch(batchId, activeSymbols);
+
+          // STAGE 4 FIX #1: Store what symbols we subscribed to
+          loopState.lastActiveSymbols = [...activeSymbols];
+
           for await (const { symbol, ticker } of subscription) {
             if (!this.isRunning) break;
+
+            // STAGE 4 FIX #1: Check if symbols changed during iteration
+            const currentSymbols = loopState.symbols.filter(
+              s => !this.registry.getNonRetryableSymbols().has(s)
+            );
+            const symbolsChanged = currentSymbols.length !== loopState.lastActiveSymbols.length ||
+              !currentSymbols.every(s => loopState.lastActiveSymbols.includes(s));
+
+            if (symbolsChanged) {
+              this.config.logger('info', `SubscriptionEngine: Symbols changed, restarting subscription [${batchId}]`, {
+                before: loopState.lastActiveSymbols.length,
+                after: currentSymbols.length,
+              });
+              break;  // Exit for await to restart with new symbols in while loop
+            }
 
             // Update batch-local health
             this.adapterPool.recordDataForBatch(batchId);
@@ -367,6 +395,13 @@ class SubscriptionEngine {
       }
 
       this.config.logger('info', `SubscriptionEngine: Subscription loop ended [${batchId}]`);
+
+      // STAGE 4 FIX #2: Clean up batch if it was paused for removal
+      if (loopState && loopState.paused) {
+        this.config.logger('info', `SubscriptionEngine: Cleaning up paused batch [${batchId}]`);
+        await this.adapterPool.closeBatch(batchId);
+        this.subscriptionLoops.delete(batchId);
+      }
     } catch (fatalError) {
       this.config.logger('error', `SubscriptionEngine: Fatal error in loop [${batchId}]`, {
         error: fatalError.message,
@@ -554,6 +589,148 @@ class SubscriptionEngine {
           });
         }
       }
+    }
+  }
+
+  /**
+   * STAGE 4: Reconcile batch allocations without full restart
+   *
+   * Incremental reconciliation: add/remove symbols from running batches
+   * - Adds new symbols to existing batches (extends current subscription)
+   * - Removes stale symbols from existing batches (subscription continues)
+   * - Preserves batch connection state and health metrics
+   * - NO stopSubscriptions() call (zero downtime)
+   *
+   * @param {Array} nextPlan - New batch allocation [{batchId, symbols}, ...]
+   * @returns {Object} - {added: [], removed: [], modified: [], unchanged: []}
+   */
+  async reconcileBatches(nextPlan) {
+    if (!this.isRunning) {
+      this.config.logger('debug', `SubscriptionEngine: reconcileBatches called but engine not running`);
+      return { added: [], removed: [], modified: [], unchanged: [] };
+    }
+
+    if (!Array.isArray(nextPlan)) {
+      throw new Error('nextPlan must be an array');
+    }
+
+    const diff = {
+      added: [],      // New batches created
+      removed: [],    // Batches that became empty/removed
+      modified: [],   // Batches with symbol changes
+      unchanged: []   // Batches with no changes
+    };
+
+    const nextPlanMap = new Map(nextPlan.map(p => [p.batchId, p.symbols]));
+
+    this.config.logger('info', `SubscriptionEngine: Starting reconciliation`, {
+      currentBatches: this.subscriptionLoops.size,
+      nextBatches: nextPlan.length,
+    });
+
+    try {
+      // Step 1: Process existing batches (modify or remove symbols)
+      for (const [batchId, loopState] of this.subscriptionLoops.entries()) {
+        if (!nextPlanMap.has(batchId)) {
+          // Batch being removed - mark as paused (STAGE 4 FIX #2)
+          loopState.paused = true;
+          loopState.symbols = [];
+
+          diff.removed.push(batchId);
+
+          // STAGE 4 FIX #3: IMMEDIATELY close adapter (don't wait for loop to detect)
+          // This forces the active subscription to end, so cleanup happens immediately
+          try {
+            await this.adapterPool.closeBatch(batchId);
+            this.config.logger('info', `SubscriptionEngine: Batch removed and adapter closed [${batchId}]`);
+          } catch (error) {
+            this.config.logger('warn', `SubscriptionEngine: Error closing adapter for ${batchId}`, {
+              error: error.message,
+            });
+          }
+        } else {
+          const nextSymbols = nextPlanMap.get(batchId);
+          const currentSymbols = loopState.symbols;
+
+          const added = nextSymbols.filter(s => !currentSymbols.includes(s));
+          const removed = currentSymbols.filter(s => !nextSymbols.includes(s));
+
+          if (added.length > 0 || removed.length > 0) {
+            // Update loop state with new symbol list
+            loopState.symbols = nextSymbols;
+
+            diff.modified.push({
+              batchId,
+              removed,
+              added
+            });
+
+            this.config.logger('info', `SubscriptionEngine: Batch modified [${batchId}]`, {
+              added: added.length,
+              removed: removed.length,
+              totalSymbols: nextSymbols.length,
+            });
+          } else {
+            diff.unchanged.push(batchId);
+          }
+        }
+      }
+
+      // Step 2: Start new batches (if any)
+      for (const [batchId, symbols] of nextPlanMap.entries()) {
+        if (!this.subscriptionLoops.has(batchId)) {
+          // New batch - add to loop state and start subscription
+          this.subscriptionLoops.set(batchId, {
+            symbols,
+            retryAttempts: 0,
+            lastActiveSymbols: [],
+            paused: false,
+          });
+
+          // Start subscription loop (staggered)
+          const currentBatchCount = this.subscriptionLoops.size - 1;
+          const delay = currentBatchCount * (this.config.subscriptionDelay || 100);
+
+          const timer = setTimeout(() => {
+            if (this.isRunning) {
+              this._subscriptionLoop(batchId).catch(error => {
+                this.config.logger('error', `SubscriptionEngine: Loop error [${batchId}]`, {
+                  error: error.message,
+                });
+              });
+            }
+          }, delay);
+
+          this.subscriptionTimers.push(timer);
+
+          diff.added.push({
+            batchId,
+            symbols,
+            count: symbols.length,
+          });
+
+          this.config.logger('info', `SubscriptionEngine: New batch started [${batchId}]`, {
+            symbols: symbols.length,
+          });
+        }
+      }
+
+      this.metrics.activeConnections = this.subscriptionLoops.size;
+
+      this.config.logger('info', `SubscriptionEngine: Reconciliation complete (Stage 4 - zero downtime)`, {
+        newBatches: diff.added.length,
+        modifiedBatches: diff.modified.length,
+        unchangedBatches: diff.unchanged.length,
+        pausedBatches: diff.removed.length,
+        totalBatches: this.subscriptionLoops.size,
+      });
+
+      return diff;
+    } catch (error) {
+      this.config.logger('error', `SubscriptionEngine: Reconciliation failed`, {
+        error: error.message,
+      });
+      throw error;
     }
   }
 

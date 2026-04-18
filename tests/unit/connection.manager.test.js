@@ -67,6 +67,7 @@ class MockSubscriptionEngine {
     this.callbacks = {};
     this.startCalls = 0;
     this.stopCalls = 0;
+    this.reconcileCalls = 0;
   }
 
   onTicker(callback) {
@@ -85,6 +86,16 @@ class MockSubscriptionEngine {
   async stopSubscriptions() {
     this.isRunning = false;
     this.stopCalls += 1;
+  }
+
+  async reconcileBatches(nextPlan) {
+    this.reconcileCalls += 1;
+    return {
+      added: [],
+      removed: [],
+      modified: [],
+      unchanged: [],
+    };
   }
 
   getStatus() {
@@ -575,7 +586,7 @@ describe('ConnectionManager', () => {
   });
 
   describe('refreshMarkets()', () => {
-    it('should restart subscriptions when running and symbol set changes', async () => {
+    it('should reconcile subscriptions when running and symbol set changes (Stage 4: zero downtime)', async () => {
       class ChangingAdapter extends MockExchangeAdapter {
         constructor(config) {
           super(config);
@@ -608,15 +619,20 @@ describe('ConnectionManager', () => {
       await localManager.initialize();
       await localManager.startSubscriptions();
       const engineBefore = localManager.subscriptionEngine;
-      const startCallsBefore = engineBefore.startCalls;
-      const stopCallsBefore = engineBefore.stopCalls;
+      const reconcileCallsBefore = engineBefore.reconcileCalls;
 
       const result = await localManager.refreshMarkets();
       const engineAfter = localManager.subscriptionEngine;
 
+      // Stage 4: Should detect new symbols
       expect(result.added).toContain('ADA/USDT');
-      expect(engineAfter.stopCalls).toBeGreaterThan(stopCallsBefore);
-      expect(engineAfter.startCalls).toBeGreaterThan(startCallsBefore);
+
+      // Stage 4: Should call reconcileBatches (not stop + start)
+      expect(engineAfter.reconcileCalls).toBeGreaterThan(reconcileCallsBefore);
+
+      // Stage 4: Should NOT restart subscriptions (no stopCalls)
+      expect(engineAfter.stopCalls).toBe(0);
+      expect(engineAfter.startCalls).toBe(1);  // Only initial start, not restarted
     });
   });
 });

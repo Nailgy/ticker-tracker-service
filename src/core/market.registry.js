@@ -271,6 +271,150 @@ class MarketRegistry {
   }
 
   /**
+   * STAGE 4: Rebalance with stable batch IDs and minimal diff
+   * Preserves existing batch IDs and only moves symbols if necessary
+   *
+   * Algorithm:
+   * 1. Remove stale symbols from existing batches
+   * 2. Find unallocated symbols (new market listings)
+   * 3. Fit new symbols into existing batches (if space available)
+   * 4. Create new batches only if existing ones are full
+   *
+   * @param {number} batchSize - Max symbols per batch
+   * @returns {Object} - { added: [], removed: [], modified: [], unchanged: [] }
+   */
+  rebalance(batchSize) {
+    if (!batchSize || batchSize <= 0) {
+      throw new Error('Invalid batchSize');
+    }
+
+    const diff = {
+      added: [],      // New batches created
+      removed: [],    // Batches that became empty
+      modified: [],   // Batches that had symbols added/removed
+      unchanged: []   // Batches with no changes
+    };
+
+    const tradableSymbols = new Set(this.desiredSymbols);
+
+    // Step 1: Remove stale symbols from existing batches
+    for (const [batchId, symbols] of this.batchAllocations.entries()) {
+      const staleSymbols = [];
+      for (const symbol of symbols) {
+        if (!tradableSymbols.has(symbol)) {
+          staleSymbols.push(symbol);
+          symbols.delete(symbol);
+          this.symbolToBatchMap.delete(symbol);
+        }
+      }
+
+      if (staleSymbols.length > 0) {
+        diff.modified.push({
+          batchId,
+          removed: staleSymbols,
+          added: []
+        });
+      }
+    }
+
+    // Step 2: Find unallocated symbols (new listings)
+    const allocatedSymbols = new Set();
+    for (const symbols of this.batchAllocations.values()) {
+      symbols.forEach(s => allocatedSymbols.add(s));
+    }
+    const unallocatedSymbols = Array.from(this.desiredSymbols).filter(
+      s => !allocatedSymbols.has(s)
+    );
+
+    // Step 3: Fit new symbols into existing batches
+    for (const batchId of this.batchAllocations.keys()) {
+      const symbols = this.batchAllocations.get(batchId);
+      let spacesAvailable = batchSize - symbols.size;
+      const addedToThisBatch = [];
+
+      while (spacesAvailable > 0 && unallocatedSymbols.length > 0) {
+        const symbol = unallocatedSymbols.shift();
+        symbols.add(symbol);
+        this.symbolToBatchMap.set(symbol, batchId);
+        addedToThisBatch.push(symbol);
+        spacesAvailable--;
+      }
+
+      if (addedToThisBatch.length > 0) {
+        // Find or create modified entry for this batch
+        const modifiedEntry = diff.modified.find(m => m.batchId === batchId);
+        if (modifiedEntry) {
+          modifiedEntry.added = addedToThisBatch;
+        } else {
+          diff.modified.push({
+            batchId,
+            removed: [],
+            added: addedToThisBatch
+          });
+        }
+      }
+
+      // If no changes to this batch, it's unchanged
+      if (!diff.modified.some(m => m.batchId === batchId)) {
+        diff.unchanged.push(batchId);
+      }
+    }
+
+    // Step 4: Create new batches only if needed
+    // STAGE 4 FIX #3: Use max batch index instead of size to avoid collisions with gaps
+    let maxBatchIndex = -1;
+    for (const batchId of this.batchAllocations.keys()) {
+      const match = batchId.match(/batch-(\d+)/);
+      if (match) {
+        const index = parseInt(match[1]);
+        maxBatchIndex = Math.max(maxBatchIndex, index);
+      }
+    }
+    let newBatchIndex = maxBatchIndex + 1;  // Start after max, not from size
+
+    while (unallocatedSymbols.length > 0) {
+      const batchId = `batch-${newBatchIndex++}`;
+      const newBatchSymbols = new Set(
+        unallocatedSymbols.splice(0, batchSize)
+      );
+      this.batchAllocations.set(batchId, newBatchSymbols);
+
+      for (const symbol of newBatchSymbols) {
+        this.symbolToBatchMap.set(symbol, batchId);
+      }
+
+      diff.added.push({
+        batchId,
+        symbols: Array.from(newBatchSymbols)
+      });
+    }
+
+    // Remove empty batches (mark as removed)
+    for (const [batchId, symbols] of this.batchAllocations.entries()) {
+      if (symbols.size === 0) {
+        diff.removed.push(batchId);
+        this.batchAllocations.delete(batchId);
+      }
+    }
+
+    this._updateMetrics();
+
+    this.config.logger('info', `MarketRegistry: Rebalance complete (Stage 4 - minimal diff)`, {
+      newBatches: diff.added.length,
+      modifiedBatches: diff.modified.length,
+      unchangedBatches: diff.unchanged.length,
+      emptyBatchesRemoved: diff.removed.length,
+      totalBatches: this.batchAllocations.size,
+      totalSymbols: Array.from(this.batchAllocations.values()).reduce(
+        (sum, batch) => sum + batch.size,
+        0
+      ),
+    });
+
+    return diff;
+  }
+
+  /**
    * Get diff between desired markets and current active
    */
   getDiffSince(previousState) {

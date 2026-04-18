@@ -46,3 +46,6 @@ dump.rdb
 tmp/
 temp/
 *.tmp
+
+.gitignore
+gemini tests/

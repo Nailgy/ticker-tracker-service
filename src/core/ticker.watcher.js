@@ -38,6 +38,10 @@ class TickerWatcher {
     // Lifecycle
     this.isRunning = false;
     this.isStopping = false;
+
+    // STAGE 4: Refresh concurrency guard (single-flight mutex + coalescing)
+    this.refreshInProgress = false;
+    this.refreshPending = false;
   }
 
   /**
@@ -213,43 +217,70 @@ class TickerWatcher {
 
   /**
    * Market discovery loop - refresh, diff, reallocate
+   * STAGE 4: Implements single-flight pattern with coalescing to prevent overlapping refreshes
    *
    * @private
    */
   async _refreshMarkets() {
+    // If already running, mark as pending and return
+    if (this.refreshInProgress) {
+      this.logger('debug', 'TickerWatcher: Refresh already in progress, marking as pending');
+      this.refreshPending = true;
+      return;
+    }
+
+    // Acquire lock
+    this.refreshInProgress = true;
+
     try {
-      if (this.isStopping) return;
+      let shouldRunAgain = true;
 
-      this.logger('debug', 'TickerWatcher: Refreshing markets...');
+      // Keep running while pending requests exist
+      while (shouldRunAgain) {
+        this.refreshPending = false;
 
-      // Call public API to refresh markets
-      const { added, removed } = await this.connectionManager.refreshMarkets();
+        if (this.isStopping) {
+          this.logger('debug', 'TickerWatcher: Stopping service, skipping market refresh');
+          break;
+        }
 
-      // Update tracking
-      for (const symbol of added) {
-        this.currentSymbols.add(symbol);
+        try {
+          this.logger('debug', 'TickerWatcher: Refreshing markets...');
+
+          // Call public API to refresh markets
+          const { added, removed } = await this.connectionManager.refreshMarkets();
+
+          // Update tracking
+          for (const symbol of added) {
+            this.currentSymbols.add(symbol);
+          }
+          for (const symbol of removed) {
+            this.currentSymbols.delete(symbol);
+          }
+
+          if (added.length === 0 && removed.length === 0) {
+            this.logger('debug', 'TickerWatcher: No market changes detected', {
+              totalSymbols: this.currentSymbols.size,
+            });
+          } else {
+            this.logger('info', 'TickerWatcher: Market refresh complete', {
+              newCount: added.length,
+              removedCount: removed.length,
+              totalSymbols: this.currentSymbols.size,
+              batchCount: this.connectionManager.getBatchCount(),
+            });
+          }
+        } catch (error) {
+          this.logger('warn', `TickerWatcher: Market refresh error: ${error.message}`, {
+            error: error.stack,
+          });
+        }
+
+        // Check if refresh was requested while we were running
+        shouldRunAgain = this.refreshPending;
       }
-      for (const symbol of removed) {
-        this.currentSymbols.delete(symbol);
-      }
-
-      if (added.length === 0 && removed.length === 0) {
-        this.logger('debug', 'TickerWatcher: No market changes detected', {
-          totalSymbols: this.currentSymbols.size,
-        });
-        return;
-      }
-
-      this.logger('info', 'TickerWatcher: Market refresh complete', {
-        newCount: added.length,
-        removedCount: removed.length,
-        totalSymbols: this.currentSymbols.size,
-        batchCount: this.connectionManager.getBatchCount(),
-      });
-    } catch (error) {
-      this.logger('warn', `TickerWatcher: Market refresh error: ${error.message}`, {
-        error: error.stack,
-      });
+    } finally {
+      this.refreshInProgress = false;
     }
   }
 
