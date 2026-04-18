@@ -343,6 +343,10 @@ class ConnectionManager {
 
       if (removed.length > 0) {
         this.#marketRegistry.removeSymbols(removed);
+        // Phase 5D: Clean dedup cache and pending batch for removed symbols
+        if (this.#redisWriter) {
+          this.#redisWriter.removeSymbols(removed);
+        }
         this.config.logger('info', `ConnectionManager: Removed symbols detected`, {
           count: removed.length,
         });

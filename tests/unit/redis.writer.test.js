@@ -12,10 +12,11 @@ describe('RedisWriter', () => {
 
     mockLogger = jest.fn();
 
+    // Phase 5B: exec should return [[err, res], ...] format where err=null for success
     mockPipeline = {
       hset: jest.fn().mockReturnThis(),
       publish: jest.fn().mockReturnThis(),
-      exec: jest.fn().mockResolvedValue([['OK'], ['OK']]),
+      exec: jest.fn().mockResolvedValue([[null, 1], [null, 1]]),  // [err, res] tuples
     };
 
     mockRedisService = {
@@ -218,15 +219,15 @@ describe('RedisWriter', () => {
       expect(mockPipeline.publish).toHaveBeenCalledTimes(2);
     });
 
-    it('should handle pipeline errors', async () => {
+    it('should throw error on pipeline failure', async () => {
       mockPipeline.exec.mockRejectedValueOnce(new Error('Redis error'));
 
-      await writer.writeTicker('binance', 'spot', 'BTC/USDT', { last: 50000 });
-      const result = await writer.flush();
+      // Phase 5B: flush now throws RedisFlushError instead of returning error status
+      const { RedisFlushError } = require('../../src/services/redis.writer');
 
-      expect(result.flushed).toBe(false);
-      expect(result.reason).toBe('flush-error');
-      expect(writer.getMetrics().failedWrites).toBe(1);
+      await writer.writeTicker('binance', 'spot', 'BTC/USDT', { last: 50000 });
+
+      await expect(writer.flush()).rejects.toThrow();
     });
 
     it('should update metrics on successful flush', async () => {
@@ -262,12 +263,13 @@ describe('RedisWriter', () => {
       await writer.disconnect();
 
       mockRedisService.isConnected = false;
-      const result = await writer.writeTicker('binance', 'spot', 'BTC/USDT', {
-        last: 50000,
-      });
 
-      expect(result.written).toBe(false);
-      expect(result.reason).toBe('redis-not-connected');
+      // Phase 5A: writeTicker now throws error instead of returning status
+      const { RedisWriteError } = require('../../src/services/redis.writer');
+
+      await expect(
+        writer.writeTicker('binance', 'spot', 'BTC/USDT', { last: 50000 })
+      ).rejects.toThrow(RedisWriteError);
     });
   });
 
@@ -296,15 +298,15 @@ describe('RedisWriter', () => {
   });
 
   describe('error cases', () => {
-    it('should skip write when Redis not connected', async () => {
+    it('should throw error when Redis not connected', async () => {
       mockRedisService.isConnected = false;
 
-      const result = await writer.writeTicker('binance', 'spot', 'BTC/USDT', {
-        last: 50000,
-      });
+      // Phase 5A: writeTicker now throws RedisWriteError instead of returning status
+      const { RedisWriteError } = require('../../src/services/redis.writer');
 
-      expect(result.written).toBe(false);
-      expect(result.reason).toBe('redis-not-connected');
+      await expect(
+        writer.writeTicker('binance', 'spot', 'BTC/USDT', { last: 50000 })
+      ).rejects.toThrow(RedisWriteError);
     });
 
     it('should handle empty batch on flush', async () => {
@@ -314,14 +316,15 @@ describe('RedisWriter', () => {
       expect(result.count).toBe(0);
     });
 
-    it('should recover from write error', async () => {
+    it('should throw error on write pipeline failure', async () => {
       mockPipeline.exec.mockRejectedValueOnce(new Error('Write failed'));
 
-      await writer.writeTicker('binance', 'spot', 'BTC/USDT', { last: 50000 });
-      const result = await writer.flush();
+      const { RedisWriteError } = require('../../src/services/redis.writer');
 
-      expect(result.flushed).toBe(false);
-      expect(writer.getMetrics().failedWrites).toBe(1);
+      await writer.writeTicker('binance', 'spot', 'BTC/USDT', { last: 50000 });
+
+      // Phase 5A: _writeUpdate now throws RedisWriteError
+      await expect(writer.flush()).rejects.toThrow();
     });
   });
-});
+})

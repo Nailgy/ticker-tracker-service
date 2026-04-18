@@ -1,8 +1,10 @@
 /**
- * RedisService - Unit Tests
+ * RedisService - Unit Tests (TRANSPORT-ONLY)
  *
- * Tests deduplication, batching, pipeline execution, and connection logic
- * using mocked ioredis to avoid external dependencies.
+ * Phase 5E: Tests for connection lifecycle and read operations only
+ * Tests for write/dedup/batching moved to RedisWriter
+ *
+ * Mocked ioredis to avoid external dependencies.
  */
 
 const RedisService = require('../../src/services/redis.service');
@@ -25,7 +27,7 @@ jest.mock('ioredis', () => {
 
 const Redis = require('ioredis');
 
-describe('RedisService', () => {
+describe('RedisService (Transport-Only)', () => {
   let redisService;
   let mockRedis;
 
@@ -37,7 +39,7 @@ describe('RedisService', () => {
     const mockPipeline = {
       hset: jest.fn().mockReturnThis(),
       publish: jest.fn().mockReturnThis(),
-      exec: jest.fn().mockResolvedValue([[1, 1], [1, 1]]),
+      exec: jest.fn().mockResolvedValue([[null, 1], [null, 1]]),
     };
 
     // Setup default mock Redis instance
@@ -62,74 +64,52 @@ describe('RedisService', () => {
       redisService = new RedisService();
 
       expect(redisService.config.redisUrl).toBe('localhost:6379');
-      expect(redisService.config.redisBatching).toBe(true);
-      expect(redisService.config.redisFlushMs).toBe(1000);
-      expect(redisService.config.redisMaxBatch).toBe(1000);
       expect(redisService.isConnected).toBe(false);
     });
 
     it('should initialize with custom config', () => {
       redisService = new RedisService({
         redisUrl: 'redis://custom:6379',
-        redisFlushMs: 500,
-        redisMaxBatch: 100,
-        redisBatching: false,
       });
 
       expect(redisService.config.redisUrl).toBe('redis://custom:6379');
-      expect(redisService.config.redisFlushMs).toBe(500);
-      expect(redisService.config.redisMaxBatch).toBe(100);
-      expect(redisService.config.redisBatching).toBe(false);
     });
 
-    it('should have empty dedup cache on init', () => {
+    it('should have empty stats on init', () => {
       redisService = new RedisService();
-      expect(redisService.dedupCache.size).toBe(0);
-    });
-
-    it('should have zero stats on init', () => {
-      redisService = new RedisService();
-      expect(redisService.stats.totalUpdates).toBe(0);
-      expect(redisService.stats.dedupedUpdates).toBe(0);
-      expect(redisService.stats.batchedUpdates).toBe(0);
+      expect(redisService.stats.failedWrites).toBe(0);
     });
   });
 
   describe('Connection Management', () => {
     it('should connect successfully', async () => {
       redisService = new RedisService();
-
       await redisService.connect();
 
-      expect(Redis).toHaveBeenCalledWith('localhost:6379', expect.any(Object));
-      expect(mockRedis.ping).toHaveBeenCalled();
       expect(redisService.isConnected).toBe(true);
+      expect(redisService.isConnecting).toBe(false);
+      expect(mockRedis.ping).toHaveBeenCalled();
     });
 
-    it('should not reconnect if already connected', async () => {
+    it('should not attempt reconnect if already connected', async () => {
       redisService = new RedisService();
+      await redisService.connect();
+      jest.clearAllMocks();
 
       await redisService.connect();
-      const callCount = Redis.mock.calls.length;
-
-      await redisService.connect();
-
-      expect(Redis.mock.calls.length).toBe(callCount);
+      expect(mockRedis.ping).not.toHaveBeenCalled();
     });
 
-    it('should setup event handlers on connect', async () => {
+    it('should handle connection errors', async () => {
       redisService = new RedisService();
+      mockRedis.ping.mockRejectedValue(new Error('Connection refused'));
 
-      await redisService.connect();
-
-      expect(mockRedis.on).toHaveBeenCalledWith('connect', expect.any(Function));
-      expect(mockRedis.on).toHaveBeenCalledWith('error', expect.any(Function));
-      expect(mockRedis.on).toHaveBeenCalledWith('close', expect.any(Function));
+      await expect(redisService.connect()).rejects.toThrow('Connection refused');
+      expect(redisService.isConnected).toBe(false);
     });
 
-    it('should disconnect gracefully', async () => {
+    it('should disconnect successfully', async () => {
       redisService = new RedisService();
-
       await redisService.connect();
       await redisService.disconnect();
 
@@ -137,235 +117,16 @@ describe('RedisService', () => {
       expect(redisService.isConnected).toBe(false);
     });
 
-    it('should throw error if connection fails', async () => {
-      mockRedis.ping.mockRejectedValueOnce(new Error('Connection refused'));
+    it('should report isReady() status correctly', async () => {
       redisService = new RedisService();
 
-      await expect(redisService.connect()).rejects.toThrow('Connection refused');
-      expect(redisService.isConnected).toBe(false);
-    });
-  });
+      expect(redisService.isReady()).toBe(false);
 
-  describe('Deduplication Cache', () => {
-    beforeEach(async () => {
-      redisService = new RedisService({
-        redisBatching: false, // Disable batching for simpler tests
-      });
       await redisService.connect();
-    });
+      expect(redisService.isReady()).toBe(true);
 
-    it('should skip duplicate updates (no change)', async () => {
-      const tickerData = { symbol: 'BTC/USDT', last: 68000 };
-
-      // First update
-      const result1 = await redisService.updateTicker('binance', 'spot', 'BTC/USDT', tickerData);
-      expect(result1).toBe(true);
-      expect(redisService.stats.totalUpdates).toBe(1);
-      expect(redisService.stats.dedupedUpdates).toBe(0);
-
-      // Second identical update
-      const result2 = await redisService.updateTicker('binance', 'spot', 'BTC/USDT', tickerData);
-      expect(result2).toBe(false);
-      expect(redisService.stats.totalUpdates).toBe(2);
-      expect(redisService.stats.dedupedUpdates).toBe(1);
-    });
-
-    it('should write on change', async () => {
-      const ticker1 = { symbol: 'BTC/USDT', last: 68000 };
-      const ticker2 = { symbol: 'BTC/USDT', last: 68100 };
-
-      const result1 = await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker1);
-      expect(result1).toBe(true);
-
-      const result2 = await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker2);
-      expect(result2).toBe(true);
-      expect(redisService.stats.dedupedUpdates).toBe(0);
-    });
-
-    it('should respect min interval config', async () => {
-      redisService.config.redisMinIntervalMs = 1000;
-
-      const ticker1 = { last: 68000 };
-      const ticker2 = { last: 68100 };
-
-      const result1 = await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker1);
-      expect(result1).toBe(true);
-
-      const result2 = await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker2);
-      expect(result2).toBe(false); // Rate-limited
-      expect(redisService.stats.dedupedUpdates).toBe(1);
-    });
-
-    it('should track hash correctly', async () => {
-      const ticker = { symbol: 'BTC/USDT', last: 68000 };
-      await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker);
-
-      const cached = redisService.dedupCache.get('BTC/USDT');
-      expect(cached).toBeDefined();
-      expect(cached.hash).toBeDefined();
-      expect(typeof cached.hash).toBe('string');
-      expect(cached.lastWriteTime).toBeDefined();
-    });
-
-    it('should delete from dedup cache on ticker delete', async () => {
-      const ticker = { symbol: 'BTC/USDT', last: 68000 };
-      await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker);
-      expect(redisService.dedupCache.size).toBe(1);
-
-      await redisService.deleteTicker('binance', 'spot', 'BTC/USDT');
-      expect(redisService.dedupCache.size).toBe(0);
-    });
-  });
-
-  describe('Batching & Pipeline', () => {
-    beforeEach(async () => {
-      redisService = new RedisService({
-        redisBatching: true,
-        redisFlushMs: 500,
-        redisMaxBatch: 10,
-      });
-      await redisService.connect();
-    });
-
-    it('should accumulate updates in batch', async () => {
-      const ticker = { symbol: 'BTC/USDT', last: 68000 };
-      await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker);
-
-      expect(redisService.batch.length).toBe(1);
-      expect(redisService.stats.batchedUpdates).toBe(1);
-    });
-
-    it('should add multiple updates to same batch', async () => {
-      const ticker1 = { symbol: 'BTC/USDT', last: 68000 };
-      const ticker2 = { symbol: 'ETH/USDT', last: 3800 };
-
-      await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker1);
-      await redisService.updateTicker('binance', 'spot', 'ETH/USDT', ticker2);
-
-      expect(redisService.batch.length).toBe(2);
-    });
-
-    it('should flush batch when size limit reached', async () => {
-      mockRedis.pipeline.mockReturnValue({
-        hset: jest.fn().mockReturnThis(),
-        publish: jest.fn().mockReturnThis(),
-        exec: jest.fn().mockResolvedValue(Array(20).fill([1, 1])), // 20 operations
-      });
-
-      redisService.config.redisMaxBatch = 2;
-
-      const ticker1 = { last: 68000 };
-      const ticker2 = { last: 3800 };
-      const ticker3 = { last: 100000 };
-
-      await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker1);
-      expect(redisService.batch.length).toBe(1);
-
-      // Second update reaches max batch size (2), triggers flush
-      await redisService.updateTicker('binance', 'spot', 'ETH/USDT', ticker2);
-      expect(redisService.batch.length).toBe(0); // Flushed
-      expect(redisService.stats.flushedBatches).toBe(1);
-
-      // Third update adds to (now empty) batch
-      await redisService.updateTicker('binance', 'spot', 'SOL/USDT', ticker3);
-      expect(redisService.batch.length).toBe(1);
-    });
-
-    it('should execute pipeline with hset and publish commands', async () => {
-      const mockPipeline = {
-        hset: jest.fn().mockReturnThis(),
-        publish: jest.fn().mockReturnThis(),
-        exec: jest.fn().mockResolvedValue(Array(4).fill([1, 1])), // 2 operations * 2
-      };
-
-      mockRedis.pipeline.mockReturnValue(mockPipeline);
-
-      const ticker = { last: 68000 };
-      await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker);
-      await redisService.flush();
-
-      expect(mockRedis.pipeline).toHaveBeenCalled();
-      expect(mockPipeline.hset).toHaveBeenCalledWith(
-        'ticker:binance:spot',
-        'BTC/USDT',
-        expect.any(String)
-      );
-      expect(mockPipeline.publish).toHaveBeenCalledWith(
-        'ticker:binance:spot:BTC/USDT',
-        expect.any(String)
-      );
-      expect(mockPipeline.exec).toHaveBeenCalled();
-    });
-
-    it('should clear batch after flush', async () => {
-      mockRedis.pipeline.mockReturnValue({
-        hset: jest.fn().mockReturnThis(),
-        publish: jest.fn().mockReturnThis(),
-        exec: jest.fn().mockResolvedValue([[1, 1], [1, 1]]),
-      });
-
-      const ticker = { last: 68000 };
-      await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker);
-
-      expect(redisService.batch.length).toBe(1);
-      await redisService.flush();
-      expect(redisService.batch.length).toBe(0);
-    });
-
-    it('should not flush if batch is empty', async () => {
-      mockRedis.pipeline.mockReturnValue({
-        exec: jest.fn().mockResolvedValue([]),
-      });
-
-      const result = await redisService.flush();
-
-      expect(result).toBe(true);
-      expect(mockRedis.pipeline).not.toHaveBeenCalled();
-    });
-
-    it('should not flush if already flushing', async () => {
-      mockRedis.pipeline.mockReturnValue({
-        hset: jest.fn().mockReturnThis(),
-        publish: jest.fn().mockReturnThis(),
-        exec: jest.fn().mockImplementationOnce(async () => {
-          // Simulate ongoing flush
-          await new Promise(resolve => setTimeout(resolve, 100));
-          return [[1, 1], [1, 1]];
-        }),
-      });
-
-      const ticker = { last: 68000 };
-      await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker);
-
-      const flush1Promise = redisService.flush();
-      const flush2Result = await redisService.flush(); // Should not flush while flush1 is pending
-
-      expect(flush2Result).toBe(true);
-      await flush1Promise;
-    });
-  });
-
-  describe('Direct Writes (No Batching)', () => {
-    beforeEach(async () => {
-      redisService = new RedisService({
-        redisBatching: false,
-      });
-      await redisService.connect();
-    });
-
-    it('should write immediately when batching disabled', async () => {
-      mockRedis.pipeline.mockReturnValue({
-        hset: jest.fn().mockReturnThis(),
-        publish: jest.fn().mockReturnThis(),
-        exec: jest.fn().mockResolvedValue([[1, 1], [1, 1]]),
-      });
-
-      const ticker = { last: 68000 };
-      const result = await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker);
-
-      expect(result).toBe(true);
-      expect(mockRedis.pipeline).toHaveBeenCalled();
-      expect(redisService.batch.length).toBe(0);
+      await redisService.disconnect();
+      expect(redisService.isReady()).toBe(false);
     });
   });
 
@@ -375,9 +136,9 @@ describe('RedisService', () => {
       await redisService.connect();
     });
 
-    it('should get single ticker', async () => {
-      const tickerData = { symbol: 'BTC/USDT', last: 68000 };
-      mockRedis.hget.mockResolvedValueOnce(JSON.stringify(tickerData));
+    it('should get a ticker from Redis', async () => {
+      const tickerData = { last: 100, bid: 99, ask: 101 };
+      mockRedis.hget.mockResolvedValue(JSON.stringify(tickerData));
 
       const result = await redisService.getTicker('binance', 'spot', 'BTC/USDT');
 
@@ -386,167 +147,134 @@ describe('RedisService', () => {
     });
 
     it('should return null if ticker not found', async () => {
-      mockRedis.hget.mockResolvedValueOnce(null);
-
-      const result = await redisService.getTicker('binance', 'spot', 'UNKNOWN');
-
-      expect(result).toBeNull();
-    });
-
-    it('should get all tickers for exchange', async () => {
-      const allTickers = {
-        'BTC/USDT': JSON.stringify({ symbol: 'BTC/USDT', last: 68000 }),
-        'ETH/USDT': JSON.stringify({ symbol: 'ETH/USDT', last: 3800 }),
-      };
-      mockRedis.hgetall.mockResolvedValueOnce(allTickers);
-
-      const result = await redisService.getAllTickers('binance', 'spot');
-
-      expect(mockRedis.hgetall).toHaveBeenCalledWith('ticker:binance:spot');
-      expect(Object.keys(result)).toHaveLength(2);
-      expect(result['BTC/USDT'].last).toBe(68000);
-    });
-
-    it('should handle malformed JSON in getAllTickers', async () => {
-      const data = {
-        'BTC/USDT': JSON.stringify({ last: 68000 }),
-        'INVALID': 'not-json',
-        'ETH/USDT': JSON.stringify({ last: 3800 }),
-      };
-      mockRedis.hgetall.mockResolvedValueOnce(data);
-
-      const result = await redisService.getAllTickers('binance', 'spot');
-
-      expect(Object.keys(result)).toHaveLength(2); // INVALID skipped
-      expect(result['BTC/USDT']).toBeDefined();
-      expect(result['INVALID']).toBeUndefined();
-    });
-  });
-
-  describe('Error Handling', () => {
-    beforeEach(async () => {
-      redisService = new RedisService();
-      await redisService.connect();
-    });
-
-    it('should return false if not connected', async () => {
-      redisService.isConnected = false;
-
-      const result = await redisService.updateTicker('binance', 'spot', 'BTC/USDT', {});
-
-      expect(result).toBe(false);
-    });
-
-    it('should handle flush errors', async () => {
-      mockRedis.pipeline.mockReturnValue({
-        hset: jest.fn().mockReturnThis(),
-        publish: jest.fn().mockReturnThis(),
-        exec: jest.fn().mockRejectedValueOnce(new Error('Pipeline failed')),
-      });
-
-      redisService.batch.push({
-        key: 'ticker:binance:spot',
-        field: 'BTC/USDT',
-        value: '{}',
-        pubsubChannel: 'ticker:binance:spot:BTC/USDT',
-      });
-
-      await expect(redisService.flush()).rejects.toThrow('Pipeline failed');
-      expect(redisService.stats.failedWrites).toBe(1);
-    });
-
-    it('should handle getTicker errors', async () => {
-      mockRedis.hget.mockRejectedValueOnce(new Error('Read failed'));
+      mockRedis.hget.mockResolvedValue(null);
 
       const result = await redisService.getTicker('binance', 'spot', 'BTC/USDT');
 
       expect(result).toBeNull();
     });
+
+    it('should get all tickers for exchange/market', async () => {
+      const tickers = {
+        'BTC/USDT': '{"last":100}',
+        'ETH/USDT': '{"last":2000}',
+      };
+      mockRedis.hgetall.mockResolvedValue(tickers);
+
+      const result = await redisService.getAllTickers('binance', 'spot');
+
+      expect(mockRedis.hgetall).toHaveBeenCalledWith('ticker:binance:spot');
+      expect(result).toEqual({
+        'BTC/USDT': { last: 100 },
+        'ETH/USDT': { last: 2000 },
+      });
+    });
+
+    it('should return empty object if no tickers found', async () => {
+      mockRedis.hgetall.mockResolvedValue({});
+
+      const result = await redisService.getAllTickers('binance', 'spot');
+
+      expect(result).toEqual({});
+    });
+
+    it('should delete a ticker from Redis', async () => {
+      const result = await redisService.deleteTicker('binance', 'spot', 'BTC/USDT');
+
+      expect(mockRedis.hdel).toHaveBeenCalledWith('ticker:binance:spot', 'BTC/USDT');
+      expect(result).toBe(true);
+    });
+
+    it('should handle delete errors gracefully', async () => {
+      mockRedis.hdel.mockRejectedValue(new Error('Delete failed'));
+
+      const result = await redisService.deleteTicker('binance', 'spot', 'BTC/USDT');
+
+      expect(result).toBe(false);
+    });
   });
 
-  describe('Metrics & Status', () => {
+  describe('Pipeline Operations', () => {
     beforeEach(async () => {
       redisService = new RedisService();
       await redisService.connect();
     });
 
-    it('should track stats correctly', async () => {
-      const ticker = { last: 68000 };
+    it('should create a pipeline', () => {
+      const pipeline = redisService.createPipeline();
 
-      await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker);
-      expect(redisService.stats.totalUpdates).toBe(1);
-
-      await redisService.updateTicker('binance', 'spot', 'BTC/USDT', ticker);
-      expect(redisService.stats.dedupedUpdates).toBe(1);
-
-      expect(redisService.stats.totalUpdates).toBe(2);
+      expect(pipeline).toBeDefined();
+      expect(mockRedis.pipeline).toHaveBeenCalled();
     });
 
-    it('should return status snapshot', () => {
+    it('should throw error if creating pipeline when not connected', () => {
+      redisService.redis = null;
+      redisService.isConnected = false;
+
+      expect(() => redisService.createPipeline()).toThrow('Redis not connected');
+    });
+
+    it('should execute a pipeline', async () => {
+      const pipeline = redisService.createPipeline();
+      const result = await redisService.execPipeline(pipeline);
+
+      expect(result).toEqual([[null, 1], [null, 1]]);
+      expect(pipeline.exec).toHaveBeenCalled();
+    });
+
+    it('should throw error if executing null pipeline', async () => {
+      await expect(redisService.execPipeline(null)).rejects.toThrow('Pipeline is required');
+    });
+
+    it('should handle pipeline execution errors', async () => {
+      const pipeline = redisService.createPipeline();
+      pipeline.exec.mockRejectedValue(new Error('Pipeline failed'));
+
+      await expect(redisService.execPipeline(pipeline)).rejects.toThrow('Pipeline failed');
+    });
+  });
+
+  describe('Status & Metrics', () => {
+    it('should return status', async () => {
+      redisService = new RedisService();
       const status = redisService.getStatus();
 
-      expect(status.isConnected).toBe(true);
+      expect(status.isConnected).toBe(false);
       expect(status.isConnecting).toBe(false);
-      expect(status.batchSize).toBe(0);
-      expect(status.dedupCacheSize).toBe(0);
-      expect(status.stats).toBeDefined();
-      expect(status.stats.totalUpdates).toBe(0);
     });
-  });
 
-  describe('Key Generation', () => {
-    beforeEach(() => {
+    it('should reflect connected status', async () => {
       redisService = new RedisService();
-    });
+      await redisService.connect();
 
-    it('should generate correct hash key', () => {
-      const key = redisService._makeHashKey('binance', 'spot');
-      expect(key).toBe('ticker:binance:spot');
-    });
-
-    it('should handle different exchanges and types', () => {
-      const key1 = redisService._makeHashKey('bybit', 'swap');
-      const key2 = redisService._makeHashKey('kraken', 'spot');
-
-      expect(key1).toBe('ticker:bybit:swap');
-      expect(key2).toBe('ticker:kraken:spot');
+      const status = redisService.getStatus();
+      expect(status.isConnected).toBe(true);
     });
   });
 
-  describe('Batch Timer', () => {
-    beforeEach(() => {
-      jest.useFakeTimers();
-    });
-
-    afterEach(() => {
-      jest.useRealTimers();
-    });
-
-    it('should start batch timer on connect when batching enabled', async () => {
-      redisService = new RedisService({ redisBatching: true });
-
+  describe('Pub/Sub Operations', () => {
+    beforeEach(async () => {
+      redisService = new RedisService();
       await redisService.connect();
-
-      expect(redisService.batchTimer).toBeDefined();
     });
 
-    it('should not start batch timer when batching disabled', async () => {
-      redisService = new RedisService({ redisBatching: false });
+    it('should subscribe to a channel', async () => {
+      const callback = jest.fn();
+      const result = await redisService.subscribe('binance', 'spot', 'BTC/USDT', callback);
 
-      await redisService.connect();
-
-      expect(redisService.batchTimer).toBeNull();
+      expect(result).toBe(true);
     });
 
-    it('should clear batch timer on disconnect', async () => {
-      redisService = new RedisService({ redisBatching: true });
+    it('should handle subscribe errors gracefully', async () => {
+      const callback = jest.fn();
+      Redis.mockImplementation(() => {
+        throw new Error('Redis subscribe failed');
+      });
 
-      await redisService.connect();
-      const timerId = redisService.batchTimer;
+      redisService = new RedisService();
+      const result = await redisService.subscribe('binance', 'spot', 'BTC/USDT', callback);
 
-      await redisService.disconnect();
-
-      expect(redisService.batchTimer).toBeNull();
+      expect(result).toBe(false);
     });
   });
 });

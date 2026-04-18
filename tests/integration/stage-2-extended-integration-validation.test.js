@@ -145,7 +145,15 @@ describe('Stage 2 - UC2: Per-Batch Adapter Isolation (Blast Radius)', () => {
     const manager = new ConnectionManager({
       batchSize: 2, // 4 coins / 2 = 2 BATCHES
       strategyMode: 'BATCH_WATCH_TICKERS',
-      redisService: mockRedis,
+      redisService: {
+        isReady: () => true,
+        createPipeline: () => ({
+          hset: jest.fn().mockReturnThis(),
+          publish: jest.fn().mockReturnThis(),
+          exec: jest.fn().mockResolvedValue([[null, 1], [null, 1]]),
+        }),
+        execPipeline: jest.fn().mockResolvedValue([[null, 1], [null, 1]]),
+      },
       adapterFactory: mockAdapterFactory,
       retryBaseDelayMs: 5000,
       logger: () => {},
@@ -196,7 +204,15 @@ describe('Stage 2 - UC3: Lifecycle State Preservation', () => {
 
     const manager = new ConnectionManager({
       batchSize: 10,
-      redisService: { isReady: () => true },
+      redisService: {
+        isReady: () => true,
+        createPipeline: () => ({
+          hset: jest.fn().mockReturnThis(),
+          publish: jest.fn().mockReturnThis(),
+          exec: jest.fn().mockResolvedValue([[null, 1], [null, 1]]),
+        }),
+        execPipeline: jest.fn().mockResolvedValue([[null, 1], [null, 1]]),
+      },
       adapterFactory: mockAdapterFactory,
       logger: () => {},
     });
@@ -262,10 +278,12 @@ describe('Stage 2 - UC4: Mid-Flight Symbol Delisting Self-Healing', () => {
       strategyMode: 'BATCH_WATCH_TICKERS',
       redisService: {
         isReady: () => true,
-        pipeline: () => ({
-          hset: () => ({ publish: () => ({}) }),
-          exec: async () => [],
+        createPipeline: () => ({
+          hset: jest.fn().mockReturnThis(),
+          publish: jest.fn().mockReturnThis(),
+          exec: jest.fn().mockResolvedValue([[null, 1], [null, 1]]),
         }),
+        execPipeline: jest.fn().mockResolvedValue([[null, 1], [null, 1]]),
       },
       adapterFactory: mockAdapterFactory,
       logger: () => {},
@@ -324,7 +342,15 @@ describe('Stage 2 - UC5: Memory Leak Prevention (Accordion Effect)', () => {
     const manager = new ConnectionManager({
       batchSize: 2, // 10 coins = 5 batches
       strategyMode: 'BATCH_WATCH_TICKERS',
-      redisService: { isReady: () => true },
+      redisService: {
+        isReady: () => true,
+        createPipeline: () => ({
+          hset: jest.fn().mockReturnThis(),
+          publish: jest.fn().mockReturnThis(),
+          exec: jest.fn().mockResolvedValue([[null, 1], [null, 1]]),
+        }),
+        execPipeline: jest.fn().mockResolvedValue([[null, 1], [null, 1]]),
+      },
       adapterFactory: mockAdapterFactory,
       logger: () => {},
     });

@@ -6,18 +6,51 @@
  * - Pub/sub publishing
  * - Deduplication (skip writes for unchanged data)
  * - Rate limiting per symbol
- * - Pipeline batching
+ * - Pipeline batching with single-flight concurrency guard (Phase 5C)
+ * - Typed error propagation (Phase 5A+5B)
+ * - Symbol cache cleanup (Phase 5D)
  *
  * This is the ONLY place where tickers are written to Redis.
+ * Single authority for all write semantics.
  *
  * Usage:
  *   const writer = new RedisWriter(redisService, config);
- *   const {written} = await writer.writeTicker('binance', 'spot', 'BTC/USDT', tickerData);
+ *   try {
+ *     await writer.writeTicker('binance', 'spot', 'BTC/USDT', tickerData);
+ *   } catch (error) {
+ *     if (error instanceof RedisWriteError) { ... }
+ *   }
  *   await writer.flush();
  *   await writer.disconnect();
  */
 
 const crypto = require('crypto');
+
+/**
+ * Typed error for write failures (Phase 5A)
+ * @example
+ * throw new RedisWriteError('Redis not connected', 'redis-not-connected')
+ */
+class RedisWriteError extends Error {
+  constructor(message, reason) {
+    super(message);
+    this.name = 'RedisWriteError';
+    this.reason = reason;
+  }
+}
+
+/**
+ * Typed error for flush failures (Phase 5B)
+ * @example
+ * throw new RedisFlushError('Pipeline partial failure: 2/10', 2)
+ */
+class RedisFlushError extends Error {
+  constructor(message, failedCount) {
+    super(message);
+    this.name = 'RedisFlushError';
+    this.failedCount = failedCount;
+  }
+}
 
 class RedisWriter {
   constructor(redisService, config = {}) {
@@ -37,6 +70,9 @@ class RedisWriter {
     // Batching state (State-Collapsing Queue: only latest value per symbol!)
     this.batch = new Map(); // Map<symbol, update>
     this.batchTimer = null;
+
+    // Phase 5C: Single-flight flush guard
+    this.flushPromise = null;
 
     // Metrics
     this.metrics = {
@@ -59,13 +95,14 @@ class RedisWriter {
 
   /**
    * Write a ticker update
+   * Phase 5A: Now throws typed errors instead of returning status dict
    */
   async writeTicker(exchange, marketType, symbol, tickerData) {
+    // Phase 5A: Throw instead of return false
     if (!this.redisService.isReady()) {
-      this.config.logger('warn', `RedisWriter: Redis not connected, skipping write`, {
-        symbol,
-      });
-      return { written: false, reason: 'redis-not-connected' };
+      this.metrics.failedWrites++;
+      this.config.logger('error', `RedisWriter: Redis not connected`, { symbol });
+      throw new RedisWriteError('Redis not connected', 'redis-not-connected');
     }
 
     this.metrics.totalWrites++;
@@ -119,7 +156,13 @@ class RedisWriter {
 
       // Start batch timer if not already running
       if (!this.batchTimer && this.config.redisFlushMs > 0) {
-        this.batchTimer = setTimeout(() => this.flush(), this.config.redisFlushMs);
+        this.batchTimer = setTimeout(async () => {
+          try {
+            await this.flush();
+          } catch (error) {
+            // Error already logged in flush(), don't double-log
+          }
+        }, this.config.redisFlushMs);
       }
 
       return { written: true, batched: true };
@@ -131,13 +174,26 @@ class RedisWriter {
 
   /**
    * Write a single update immediately
+   * Phase 5A: Now throws typed errors instead of returning status
+   * BLOCKING FIX: Validate tuple errors in pipeline result (not just thrown exceptions)
    */
   async _writeUpdate(update) {
     try {
       const pipeline = this.redisService.createPipeline();
       pipeline.hset(update.key, update.field, update.value);
       pipeline.publish(update.pubsubChannel, update.value);
-      await this.redisService.execPipeline(pipeline);
+      const result = await this.redisService.execPipeline(pipeline);
+
+      // BLOCKING FIX: Validate tuple errors - don't assume success on non-thrown result
+      const failed = result.filter(([err]) => err != null);
+      if (failed.length > 0) {
+        this.metrics.failedWrites++;
+        const errorMsg = failed[0][0].message || 'Unknown error';
+        throw new RedisWriteError(
+          `Redis tuple error: ${errorMsg}`,
+          'tuple-error'
+        );
+      }
 
       this.config.logger('debug', `RedisWriter: Update written`, {
         symbol: update.field,
@@ -146,69 +202,153 @@ class RedisWriter {
 
       return { written: true, batched: false };
     } catch (error) {
+      // Phase 5A: Throw instead of return
+      if (error instanceof RedisWriteError) {
+        // Already counted in tuple error detection, don't double-count
+        throw error;
+      }
       this.metrics.failedWrites++;
       this.config.logger('error', `RedisWriter: Write failed`, {
         error: error.message,
       });
-      return { written: false, reason: 'write-error', error: error.message };
+      throw new RedisWriteError(error.message, 'write-error');
     }
   }
 
   /**
    * Flush batched updates
+   * Phase 5B: Validates each pipeline result tuple and requeues on failure
+   * Phase 5C: Single-flight pattern with copy-swap semantics
+   * BLOCKING FIX: Requeue on thrown execPipeline(), not just validation failure
    */
   async flush() {
+    // Clear batch timer
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
+    }
+
+    // Phase 5C: Early return if already flushing (coalesce)
+    if (this.flushPromise) {
+      return this.flushPromise;
     }
 
     if (this.batch.size === 0) {
       return { flushed: true, count: 0 };
     }
 
-    try {
-      this.config.logger('debug', `RedisWriter: Flushing batch`, {
-        count: this.batch.size,
-      });
-
-      const pipeline = this.redisService.createPipeline();
-
+    // Phase 5C: Set promise BEFORE executing (single-flight)
+    this.flushPromise = (async () => {
+      // CRITICAL FIX: Copy updates AND clear batch immediately
+      // This prevents new writes (arriving during execPipeline) from being lost
       const updates = Array.from(this.batch.values());
-      // Add all writes to pipeline
-      for (const update of updates) {
-        pipeline.hset(update.key, update.field, update.value);
-        pipeline.publish(update.pubsubChannel, update.value);
-      }
+      this.batch.clear();
 
-      // Execute atomically
-      const result = await this.redisService.execPipeline(pipeline);
+      try {
+        this.config.logger('debug', `RedisWriter: Flushing batch`, {
+          count: updates.length,
+        });
 
-      if (result && result.length > 0) {
+        const pipeline = this.redisService.createPipeline();
+
+        // Add all writes to pipeline
+        for (const update of updates) {
+          pipeline.hset(update.key, update.field, update.value);
+          pipeline.publish(update.pubsubChannel, update.value);
+        }
+
+        // Execute atomically
+        const result = await this.redisService.execPipeline(pipeline);
+
+        // Phase 5B: Validate each result tuple - ioredis returns [[err, res], [err, res], ...]
+        const failed = result.filter(([err]) => err != null);
+        if (failed.length > 0) {
+          // Validation failure: requeue updates, but ONLY if not already superseded
+          // by newer writes that arrived during the flush
+          for (const u of updates) {
+            if (!this.batch.has(u.field)) {
+              this.batch.set(u.field, u);
+            }
+          }
+          this.metrics.failedWrites++;
+          this.config.logger('error', `RedisWriter: Flush partial failure`, {
+            failed: failed.length,
+            total: result.length,
+          });
+          throw new RedisFlushError(
+            `Redis pipeline partial failure: ${failed.length}/${result.length} commands failed`,
+            failed.length
+          );
+        }
+
+        // Batch already cleared at top of try block on success
+        // All succeeded
         this.metrics.flushedBatches++;
-        this.metrics.queuedUpdates = 0;
+        this.metrics.queuedUpdates = this.batch.size;  // Account for writes that arrived during flush
         this.metrics.lastFlushAt = Date.now();
 
-        const flushCount = this.batch.size;
-        this.batch.clear();
-
         this.config.logger('info', `RedisWriter: Batch flushed`, {
-          updates: flushCount,
+          updates: updates.length,
           pipelineCommands: result.length,
         });
 
-        return { flushed: true, count: flushCount };
+        return { flushed: true, count: updates.length };
+      } catch (error) {
+        // CRITICAL FIX: On ANY error, requeue updates but ONLY if not already updated
+        // This prevents stale data from overwriting fresh writes that arrived during flush
+        for (const u of updates) {
+          if (!this.batch.has(u.field)) {
+            this.batch.set(u.field, u);
+          }
+        }
+        // CRITICAL FIX: Don't double-count metrics if this is already a typed error
+        if (!(error instanceof RedisFlushError)) {
+          this.metrics.failedWrites++;
+        }
+        this.config.logger('error', `RedisWriter: Flush failed - requeued updates`, {
+          error: error.message,
+          requeuedCount: updates.length,
+        });
+        throw error;
       }
+    })().finally(() => {
+      // Phase 5C: Release lock after success or failure
+      this.flushPromise = null;
+    });
 
-      return { flushed: false, reason: 'empty-result' };
-    } catch (error) {
-      this.metrics.failedWrites++;
-      this.config.logger('error', `RedisWriter: Flush failed`, {
-        error: error.message,
+    return this.flushPromise;
+  }
+
+  /**
+   * Remove symbols from dedup cache and pending batch
+   * Phase 5D: Called when symbols are delisted/removed from tracking
+   */
+  removeSymbols(symbols) {
+    const removed = [];
+    for (const symbol of symbols) {
+      if (this.dedupCache.delete(symbol)) {
+        removed.push(symbol);
+      }
+      // Also remove from pending batch (state-collapsing queue)
+      if (this.batch.delete(symbol)) {
+        removed.push(symbol);
+      }
+    }
+
+    if (removed.length > 0) {
+      this.metrics.queuedUpdates = this.batch.size;
+      this.config.logger('info', `RedisWriter: Cleaned symbols from cache/batch`, {
+        removed: removed.length,
+        cacheSize: this.dedupCache.size,
         batchSize: this.batch.size,
       });
-      return { flushed: false, reason: 'flush-error', error: error.message };
     }
+
+    return {
+      removed,
+      cacheSize: this.dedupCache.size,
+      batchSize: this.batch.size,
+    };
   }
 
   /**
@@ -254,3 +394,5 @@ class RedisWriter {
 }
 
 module.exports = RedisWriter;
+module.exports.RedisWriteError = RedisWriteError;
+module.exports.RedisFlushError = RedisFlushError;
