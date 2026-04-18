@@ -155,13 +155,14 @@ class CCXTAdapter extends ExchangeAdapter {
    * Load available markets
    * STAGE 4: Always use reload: true to get fresh market list from exchange
    */
-  async loadMarkets() {
+  async loadMarkets(params = {}) {
     try {
       this.config.logger('debug', `CCXTAdapter: Loading markets`, {
         exchange: this.config.exchange,
       });
 
-      const markets = await this.exchangeInstance.loadMarkets({ reload: true });
+      // Always force reload to detect new/delisted symbols (Stage 4 requirement)
+      const markets = await this.exchangeInstance.loadMarkets({ reload: true, ...params });
       let marketArray = Array.isArray(markets) ? markets : Object.values(markets);
 
       // Filter by market type

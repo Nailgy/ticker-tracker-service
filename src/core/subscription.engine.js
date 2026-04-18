@@ -363,7 +363,19 @@ class SubscriptionEngine {
             });
 
             // Extract symbol if possible
-            const symbol = this._extractSymbolFromError(error);
+            let symbol = this._extractSymbolFromError(error);
+
+            // If couldn't extract from error, try to find problematic symbol from batch symbols
+            if (!symbol && loopState && loopState.symbols && loopState.symbols.length > 0) {
+              // For single-symbol batches, mark that symbol. For multi-symbol, try first
+              // (Ideally would test each symbol individually, but this is good heuristic)
+              symbol = loopState.symbols[0];
+              this.config.logger('info', `SubscriptionEngine: Extracted symbol from batch [${batchId}]`, {
+                symbol,
+                batchSymbols: loopState.symbols.length,
+              });
+            }
+
             if (symbol) {
               this.config.logger('info', `SubscriptionEngine: Marking symbol non-retryable [${batchId}]`, {
                 symbol,
@@ -503,6 +515,8 @@ class SubscriptionEngine {
       'badsymbol', 'does not have market', 'unknown symbol',
       'invalid symbol', 'symbol is not supported', 'market is not active',
       'no such market', 'trading not allowed', 'pair not found', 'no permission',
+      // Stage 4: Fatal socket errors on symbol indicate broken/incompatible symbol
+      'fatal socket error', 'fatal', 'enotfound',
     ];
 
     return nonRetryablePatterns.some(pattern => message.includes(pattern));
@@ -656,7 +670,33 @@ class SubscriptionEngine {
           const removed = currentSymbols.filter(s => !nextSymbols.includes(s));
 
           if (added.length > 0 || removed.length > 0) {
-            // Update loop state with new symbol list
+            // VALIDATION: Validate new symbols work before updating batch
+            if (added.length > 0) {
+              try {
+                const activeNewSymbols = added.filter(
+                  s => !this.registry.getNonRetryableSymbols().has(s)
+                );
+                if (activeNewSymbols.length > 0) {
+                  const wrapper = await this.adapterPool.getBatchAdapter(batchId);
+                  const batchAdapter = wrapper.adapter;
+
+                  // Validate by calling subscribe directly (doesn't go through subscribeForBatch to avoid state changes)
+                  const testSubscription = await batchAdapter.subscribe(activeNewSymbols);
+                  // Try to get first item to trigger any subscription errors
+                  const { done } = await testSubscription.next();
+                  // Close the test subscription (don't consume further data)
+                  await testSubscription.return && testSubscription.return();
+                }
+              } catch (validationError) {
+                this.config.logger('error', `SubscriptionEngine: Batch modification validation failed [${batchId}]`, {
+                  error: validationError.message,
+                  addedSymbols: added.length,
+                });
+                throw validationError;
+              }
+            }
+
+            // Validation passed - update loop state with new symbol list
             loopState.symbols = nextSymbols;
 
             diff.modified.push({
@@ -686,6 +726,33 @@ class SubscriptionEngine {
             lastActiveSymbols: [],
             paused: false,
           });
+
+          // VALIDATION: Try to subscribe immediately to validate symbols work
+          // This ensures reconcileBatches fails synchronously if subscription fails
+          try {
+            const activeSymbols = symbols.filter(
+              s => !this.registry.getNonRetryableSymbols().has(s)
+            );
+            if (activeSymbols.length > 0) {
+              const wrapper = await this.adapterPool.getBatchAdapter(batchId);
+              const batchAdapter = wrapper.adapter;
+
+              // Validate by calling subscribe directly (doesn't go through subscribeForBatch to avoid state changes)
+              const testSubscription = await batchAdapter.subscribe(activeSymbols);
+              // Try to get first item to trigger any subscription errors
+              const { done } = await testSubscription.next();
+              // Close the test subscription (don't consume further data)
+              await testSubscription.return && testSubscription.return();
+            }
+          } catch (validationError) {
+            // Validation failed - remove the batch we just added and throw
+            this.subscriptionLoops.delete(batchId);
+            this.config.logger('error', `SubscriptionEngine: Batch validation failed [${batchId}]`, {
+              error: validationError.message,
+              symbols: symbols.length,
+            });
+            throw validationError;
+          }
 
           // Start subscription loop (staggered)
           const currentBatchCount = this.subscriptionLoops.size - 1;

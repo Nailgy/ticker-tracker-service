@@ -62,12 +62,14 @@ class MarketRegistry {
 
   /**
    * Load desired markets from adapter
+   * STAGE 4: Force cache refresh with reload: true to detect new/delisted symbols
    */
   async loadDesiredMarkets(adapter) {
     try {
       this.config.logger('debug', `MarketRegistry: Loading desired markets from adapter`);
 
-      const markets = await adapter.loadMarkets();
+      // Stage 4 requirement: Force CCXT to refresh cache, not return cached markets
+      const markets = await adapter.loadMarkets({ reload: true });
       const symbols = markets.map(m => m.symbol);
 
       // Filter out non-retryable symbols to keep them permanently evicted

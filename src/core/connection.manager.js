@@ -56,6 +56,7 @@ class ConnectionManager {
   #marketRegistry = null;
   #redisWriter = null;
   #batches = [];
+  #isRefreshing = false;  // Concurrency guard (mutex) for single-flight refreshMarkets()
 
   constructor(config = {}) {
     this.config = {
@@ -287,11 +288,19 @@ class ConnectionManager {
   /**
    * Refresh markets and reallocate symbols
    * STAGE 4: Incremental reconciliation without full restart
+   * CONCURRENCY GUARD: Single-flight mutex prevents concurrent API calls to exchange
    */
   async refreshMarkets() {
     if (!this.isInitialized) {
       throw new Error('ConnectionManager not initialized');
     }
+
+    // --- CONCURRENCY GUARD (Single-flight mutex) ---
+    if (this.#isRefreshing) {
+      this.config.logger('debug', `ConnectionManager: Refresh already in progress, skipping (coalescing)`);
+      return { added: [], removed: [] };  // Skip, don't make concurrent exchange call
+    }
+    this.#isRefreshing = true;  // Acquire lock
 
     try {
       this.config.logger('debug', `ConnectionManager: Refreshing markets (Stage 4 - zero downtime)`);
@@ -384,21 +393,44 @@ class ConnectionManager {
             pausedBatches: reconcileDiff.removed.length,
           });
         } catch (reconcileError) {
-          // STAGE 4 FIX #4: Atomic rollback - restore ALL state to pre-refresh
-          // Critical: all mutable state must roll back atomically to keep manager consistent
-          this.config.logger('error', `ConnectionManager: Reconciliation failed, rolling back ALL registry and batch state to pre-refresh`, {
+          // ATOMIC ROLLBACK for symbol changes: If reconcile fails, undo add/remove
+          this.config.logger('error', `ConnectionManager: Reconciliation failed, rolling back symbol changes (atomic transaction)`, {
             error: reconcileError.message,
+            addedSymbols: added.length,
+            removedSymbols: removed.length,
           });
 
-          // Restore registry to pre-refresh state (snapshot was taken before all mutations)
+          // CRITICAL FIX: Mark failed symbols as non-retryable to prevent "Groundhog Day" infinite loop
+          // If new symbols caused reconciliation to fail, they're likely broken/incompatible
+          // Blacklisting them prevents endless retry attempts on future refreshes
+          if (added.length > 0) {
+            this.#marketRegistry.markNonRetryable(added, 'reconcile_fatal_error', {
+              errorMessage: reconcileError.message,
+              timestamp: new Date().toISOString(),
+            });
+            this.config.logger('info', `ConnectionManager: Marked failed symbols as non-retryable (blacklist)`, {
+              count: added.length,
+              reason: 'reconcile_fatal_error',
+              error: reconcileError.message,
+            });
+          }
+
+          // Roll back ONLY the symbol changes (add/remove mutations)
+          if (added.length > 0) {
+            this.#marketRegistry.removeSymbols(added);
+            this.config.logger('debug', `ConnectionManager: Rolled back added symbols`, { count: added.length });
+          }
+          if (removed.length > 0) {
+            this.#marketRegistry.addSymbols(removed);
+            this.config.logger('debug', `ConnectionManager: Rolled back removed symbols`, { count: removed.length });
+          }
+
+          // Also restore the broader state from snapshot (redundant but defensive)
           this.#marketRegistry.batchAllocations = registrySnapshot.batchAllocations;
           this.#marketRegistry.symbolToBatchMap = registrySnapshot.symbolToBatchMap;
           this.#marketRegistry.desiredSymbols = registrySnapshot.desiredSymbols;
           this.#marketRegistry.activeSymbols = registrySnapshot.activeSymbols;
-          // CRITICAL: Restore metrics too (for full atomic state consistency)
           this.#marketRegistry.metrics = { ...registrySnapshot.metrics };
-
-          // Restore #batches to original state
           this.#batches = originalBatches;
 
           throw reconcileError;  // Propagate error to caller
@@ -411,6 +443,10 @@ class ConnectionManager {
         error: error.message,
       });
       throw error;
+    } finally {
+      // --- RELEASE MUTEX ---
+      // finally guarantees lock is released even if error occurs
+      this.#isRefreshing = false;
     }
   }
 
